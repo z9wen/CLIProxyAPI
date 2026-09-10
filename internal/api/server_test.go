@@ -2711,3 +2711,34 @@ func TestUpdateClientsContext_AntigravityConnectionPoolPurgesTransports(t *testi
 		t.Fatalf("AntigravityTransportsLen() after reload = %d, want 0", got)
 	}
 }
+
+// The Codex profile notice is appended to the panel, never rewritten into it, so
+// a panel revision this code has never seen still renders.
+func TestInjectBeforeBodyCloseAppendsInsideBody(t *testing.T) {
+	t.Parallel()
+
+	page := []byte("<html><body><div id=\"app\"></div></body></html>")
+	got := string(injectBeforeBodyClose(page, "<span id=\"notice\"></span>"))
+
+	if !strings.Contains(got, `<div id="app"></div><span id="notice"></span></body>`) {
+		t.Fatalf("notice not inserted before </body>: %s", got)
+	}
+	if strings.Count(got, "</body>") != 1 {
+		t.Fatalf("closing body tag duplicated: %s", got)
+	}
+}
+
+func TestInjectBeforeBodyCloseHandlesUppercaseAndMissingTag(t *testing.T) {
+	t.Parallel()
+
+	upper := string(injectBeforeBodyClose([]byte("<HTML><BODY>x</BODY></HTML>"), "<b>n</b>"))
+	if !strings.Contains(upper, "x<b>n</b></BODY>") {
+		t.Fatalf("uppercase </BODY> not matched: %s", upper)
+	}
+
+	// A document without a closing body tag must still render the notice.
+	noBody := string(injectBeforeBodyClose([]byte("<html>x</html>"), "<b>n</b>"))
+	if !strings.HasSuffix(noBody, "<b>n</b>") {
+		t.Fatalf("fallback append missing: %s", noBody)
+	}
+}

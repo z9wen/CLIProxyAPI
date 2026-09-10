@@ -1,13 +1,17 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"html/template"
 	"net/http"
 	"os"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -326,5 +330,52 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		}
 	}
 
-	c.File(filePath)
+	// When the captured Codex profile no longer describes the newest release, the
+	// advertised identity is held back (see registry.CodexProfileIsCurrent). That
+	// is a safe state, not a broken one, so it must not read as an error — but it
+	// is also invisible unless someone reads the log, which is how a re-capture
+	// gets forgotten. The panel is where the operator already looks.
+	//
+	// The notice is appended to the panel response rather than fetched by a
+	// script: no API call, no coupling to the panel's own auth storage, and it
+	// applies to whatever panel revision is on disk. It is only added when there
+	// is something to say, and only ever inserted, never rewritten.
+	panel, errRead := os.ReadFile(filePath)
+	if errRead != nil {
+		log.WithError(errRead).Error("failed to read management control panel asset")
+		c.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+	if notice := codexProfileNoticeHTML(); notice != "" {
+		panel = injectBeforeBodyClose(panel, notice)
+	}
+	c.Data(http.StatusOK, "text/html; charset=utf-8", panel)
+}
+
+// codexProfileNoticeHTML renders the banner shown when the advertised Codex
+// version is held back. Returns "" when there is nothing to report.
+func codexProfileNoticeHTML() string {
+	if registry.CodexProfileIsCurrent() {
+		return ""
+	}
+	advertised := template.HTMLEscapeString(registry.CodexClientVersion())
+	return fmt.Sprintf(`<div style="position:fixed;top:0;left:0;right:0;z-index:2147483647;`+
+		`padding:10px 14px;background:#7c2d12;color:#fff;`+
+		`font:13px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;text-align:center">`+
+		`Codex profile is behind upstream: this proxy advertises %s because a newer release changed its TLS `+
+		`stack and the handshake was not re-captured yet. Re-run tools/codexfp to update it.</div>`,
+		advertised)
+}
+
+// injectBeforeBodyClose appends fragment just before </body>. Falling back to a
+// plain append keeps the panel working if the document has no closing body tag.
+func injectBeforeBodyClose(page []byte, fragment string) []byte {
+	marker := []byte("</body>")
+	if index := bytes.LastIndex(bytes.ToLower(page), marker); index >= 0 {
+		out := make([]byte, 0, len(page)+len(fragment))
+		out = append(out, page[:index]...)
+		out = append(out, fragment...)
+		return append(out, page[index:]...)
+	}
+	return append(page, fragment...)
 }
