@@ -36,9 +36,18 @@ import (
 // id and key share differ. Re-capture whenever the advertised Codex version
 // changes and keep these in sync with tools/codexfp/testdata.
 
-// codexOpenSSLClientHelloSpec reproduces the ClientHello emitted by the official
-// Linux Codex build (musl, vendored OpenSSL 3.6.3) on its HTTP/SSE path.
+// codexOpenSSLClientHelloSpec returns the ClientHello for the HTTP/SSE path: a
+// capture from disk when one exists, otherwise the built-in literal.
 func codexOpenSSLClientHelloSpec() *tls.ClientHelloSpec {
+	if spec := capturedCodexProfile(codexProfileHTTP); spec != nil {
+		return spec
+	}
+	return builtinCodexOpenSSLClientHelloSpec()
+}
+
+// builtinCodexOpenSSLClientHelloSpec reproduces the ClientHello emitted by the
+// official Linux Codex build (musl, vendored OpenSSL 3.6.3) on its HTTP/SSE path.
+func builtinCodexOpenSSLClientHelloSpec() *tls.ClientHelloSpec {
 	return &tls.ClientHelloSpec{
 		CipherSuites: []uint16{
 			tls.TLS_AES_256_GCM_SHA384,
@@ -129,9 +138,18 @@ func codexOpenSSLClientHelloSpec() *tls.ClientHelloSpec {
 	}
 }
 
-// CodexWebSocketClientHelloSpec reproduces the ClientHello emitted on the Codex
-// WebSocket handshake, which uses rustls with the aws-lc-rs provider.
+// CodexWebSocketClientHelloSpec returns the ClientHello for the WebSocket path: a
+// capture from disk when one exists, otherwise the built-in literal.
 func CodexWebSocketClientHelloSpec() *tls.ClientHelloSpec {
+	if spec := capturedCodexProfile(codexProfileWebSocket); spec != nil {
+		return spec
+	}
+	return builtinCodexWebSocketClientHelloSpec()
+}
+
+// builtinCodexWebSocketClientHelloSpec reproduces the ClientHello emitted on the
+// Codex WebSocket handshake, which uses rustls with the aws-lc-rs provider.
+func builtinCodexWebSocketClientHelloSpec() *tls.ClientHelloSpec {
 	return &tls.ClientHelloSpec{
 		CipherSuites: []uint16{
 			tls.TLS_AES_256_GCM_SHA384,

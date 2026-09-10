@@ -30,6 +30,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/safemode"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/store"
 	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator"
@@ -676,6 +677,7 @@ func main() {
 			if standalone {
 				// Standalone mode: start an embedded local server and connect TUI client to it.
 				managementasset.StartAutoUpdater(context.Background(), configFilePath)
+				setupCodexTLSProfile(configFilePath)
 				misc.StartAntigravityVersionUpdater(context.Background())
 				startModelCatalogUpdaters(localModel, cfg.Home.Enabled)
 				hook := tui.NewLogHook(2000)
@@ -750,6 +752,7 @@ func main() {
 		} else {
 			// Start the main proxy service
 			managementasset.StartAutoUpdater(context.Background(), configFilePath)
+			setupCodexTLSProfile(configFilePath)
 			misc.StartAntigravityVersionUpdater(context.Background())
 			startModelCatalogUpdaters(localModel, cfg.Home.Enabled)
 			cmd.StartServiceWithPluginHost(cfg, configFilePath, password, pluginHost, serverOptions...)
@@ -765,6 +768,20 @@ func modelCatalogUpdaterPlan(localModel, homeEnabled bool) (startModels, startCo
 		return false, false
 	}
 	return !homeEnabled, true
+}
+
+// setupCodexTLSProfile points the executor at the captured ClientHello profiles.
+// A capture on disk replaces the built-in specs, so applying one does not need a
+// rebuild. A capture that will not parse is reported and ignored: the built-in
+// profile is a working fallback.
+func setupCodexTLSProfile(configFilePath string) {
+	dir := helps.DefaultCodexProfileDir(configFilePath)
+	if dir == "" {
+		return
+	}
+	if err := helps.SetCodexProfileDir(dir); err != nil {
+		log.Warnf("codex tls: captured profile unusable, keeping the built-in one: %v", err)
+	}
 }
 
 func startModelCatalogUpdaters(localModel, homeEnabled bool) {
