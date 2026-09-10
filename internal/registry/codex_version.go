@@ -164,16 +164,38 @@ var codexVersionPattern = regexp.MustCompile(`^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]
 // releases from there.
 var codexClientVersion atomic.Value
 
+// codexProfileCurrent records whether the newest release still uses the TLS stack
+// the captured profiles came from.
+//
+// While it holds, the advertised version may advance: an unchanged stack means
+// the release handshakes exactly like the captured one, so claiming its version
+// is accurate. Once it stops holding, the version is held at CodexProfileVersion,
+// because advancing it would advertise a release whose handshake this proxy does
+// not reproduce — the very incoherence these profiles exist to remove. Staying
+// put instead reads as a user who has not upgraded, which is unremarkable.
+var codexProfileCurrent atomic.Bool
+
 func init() {
 	codexClientVersion.Store(CodexProfileVersion)
+	// True by construction: the pinned version is the one that was captured.
+	codexProfileCurrent.Store(true)
 }
 
 // CodexClientVersion returns the Codex release the wire identity advertises.
 func CodexClientVersion() string {
+	if !codexProfileCurrent.Load() {
+		return CodexProfileVersion
+	}
 	if version, ok := codexClientVersion.Load().(string); ok && version != "" {
 		return version
 	}
 	return CodexProfileVersion
+}
+
+// CodexProfileIsCurrent reports whether the advertised identity still describes
+// the handshake this proxy sends.
+func CodexProfileIsCurrent() bool {
+	return codexProfileCurrent.Load()
 }
 
 // codexDriftWarned deduplicates the profile-drift warning. The updater runs on a
@@ -188,6 +210,11 @@ func SetCodexClientVersion(version string) {
 		return
 	}
 	if CodexClientVersion() == version {
+		return
+	}
+	if !codexProfileCurrent.Load() {
+		log.Debugf("codex: ignoring version %s; the advertised version is held at %s until the profile is re-captured",
+			version, CodexProfileVersion)
 		return
 	}
 	codexClientVersion.Store(version)
@@ -242,13 +269,16 @@ func refreshCodexVersion(ctx context.Context, label string) {
 		log.Warnf("%s: %v; keeping current version %s", label, err, CodexClientVersion())
 		return
 	}
+	// Checked before advancing: a drifted stack freezes the version, and doing it
+	// the other way round would briefly advertise an identity we cannot back up.
+	warnIfCodexTLSStackDrifted(ctx, version)
+
 	if CodexClientVersion() == version {
 		log.Infof("%s completed from %s, already at %s", label, source, version)
-	} else {
-		SetCodexClientVersion(version)
-		log.Infof("%s completed from %s, now advertising %s", label, source, version)
+		return
 	}
-	warnIfCodexTLSStackDrifted(ctx, version)
+	SetCodexClientVersion(version)
+	log.Infof("%s completed from %s, now advertising %s", label, source, version)
 }
 
 // warnIfCodexTLSStackDrifted reports when a release's TLS dependencies no longer
@@ -266,12 +296,15 @@ func warnIfCodexTLSStackDrifted(ctx context.Context, version string) {
 	if stack.matchesProfile() {
 		return
 	}
+	// Freeze before warning so the identity is coherent even if the log is missed.
+	codexProfileCurrent.Store(false)
 	if _, warned := codexDriftWarned.LoadOrStore(version, struct{}{}); warned {
 		return
 	}
-	log.Warnf("codex: %s ships %s, but the TLS profiles were captured from openssl-sys %s / rustls %s; "+
-		"re-capture with tools/codexfp (see tools/codexfp/README.md)",
-		version, stack, codexProfileOpenSSLSys, codexProfileRustls)
+	log.Warnf("codex: holding the advertised version at %s; %s ships %s, but the profiles were captured from "+
+		"openssl-sys %s / rustls %s. Re-capture with tools/codexfp (see tools/codexfp/README.md); until then this "+
+		"proxy keeps claiming %s, which is coherent but older than upstream.",
+		CodexProfileVersion, version, stack, codexProfileOpenSSLSys, codexProfileRustls, CodexProfileVersion)
 }
 
 func fetchLatestCodexVersion(ctx context.Context) (string, string, error) {

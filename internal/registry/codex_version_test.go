@@ -145,3 +145,32 @@ func TestParseCodexTLSStackRejectsUnrelatedDocument(t *testing.T) {
 		t.Fatal("a document with neither dependency must be rejected, not silently matched")
 	}
 }
+
+// A drifted TLS stack freezes the advertised version, so the User-Agent never
+// claims a release whose handshake this proxy does not reproduce.
+func TestCodexVersionFreezesWhenProfileDrifts(t *testing.T) {
+	// Not parallel: it mutates the package-level profile and version state.
+	previousVersion := CodexClientVersion()
+	previousCurrent := CodexProfileIsCurrent()
+	t.Cleanup(func() {
+		codexProfileCurrent.Store(previousCurrent)
+		SetCodexClientVersion(previousVersion)
+	})
+
+	// Sanity: while the stack matches, the version follows upstream.
+	codexProfileCurrent.Store(true)
+	SetCodexClientVersion("0.199.0")
+	if got := CodexClientVersion(); got != "0.199.0" {
+		t.Fatalf("with a current profile the version = %q, want 0.199.0", got)
+	}
+
+	// A drifted stack must hold the identity at the captured version.
+	codexProfileCurrent.Store(false)
+	SetCodexClientVersion("0.200.0")
+	if got := CodexClientVersion(); got != CodexProfileVersion {
+		t.Fatalf("with a drifted profile the version = %q, want it held at %q", got, CodexProfileVersion)
+	}
+	if CodexProfileIsCurrent() {
+		t.Fatal("CodexProfileIsCurrent must report false once the stack drifted")
+	}
+}
