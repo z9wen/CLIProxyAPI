@@ -27,6 +27,116 @@ import (
 // the mismatch this machinery exists to remove.
 const CodexProfileVersion = "0.154.0"
 
+// codexProfileOpenSSLSys and codexProfileRustls pin the TLS dependencies the
+// captured ClientHello profiles came from.
+//
+// These, not the release version, decide when a re-capture is due. The Codex
+// client iterates quickly — releases land constantly — but its TLS stack does
+// not move with them: openssl-sys 0.9.111 and rustls 0.23.36 were unchanged
+// across at least rust-v0.150.0 through rust-v0.154.0. Warning on every release
+// would be noise, and noise gets ignored.
+//
+// Update both alongside a fresh capture. See tools/codexfp/README.md.
+const (
+	codexProfileOpenSSLSys = "0.9.111"
+	codexProfileRustls     = "0.23.36"
+)
+
+// codexLockURLTemplate fetches a release's Cargo.lock. That file is a few
+// hundred kilobytes, so the check costs a request rather than the ~90 MB the
+// release binary would.
+const codexLockURLTemplate = "https://raw.githubusercontent.com/openai/codex/%s/codex-rs/Cargo.lock"
+
+const maxCodexLockBody = 4 << 20
+
+// codexLockPackagePattern matches a Cargo.lock [[package]] block's name and
+// version, which are adjacent lines.
+var codexLockPackagePattern = regexp.MustCompile(`(?m)^name = "([^"]+)"\nversion = "([^"]+)"`)
+
+// codexTLSStack is the part of a release's dependency set that determines the
+// shape of its ClientHello. Each crate keeps every version the lock resolved,
+// not just one.
+type codexTLSStack struct {
+	OpenSSLSys []string
+	Rustls     []string
+}
+
+// matchesProfile reports whether the captured profiles still describe this
+// release's TLS stack.
+func (s codexTLSStack) matchesProfile() bool {
+	return singleVersionEquals(s.OpenSSLSys, codexProfileOpenSSLSys) &&
+		singleVersionEquals(s.Rustls, codexProfileRustls)
+}
+
+// singleVersionEquals reports whether a crate resolved to exactly the pinned
+// version.
+//
+// Requiring a single resolution matters: mid-upgrade a lock can carry both the
+// old and the new version, and accepting the old one because it is still present
+// would be a false negative at precisely the moment the profile went stale.
+func singleVersionEquals(versions []string, want string) bool {
+	return len(versions) == 1 && versions[0] == want
+}
+
+// String renders the resolved versions for the drift warning.
+func (s codexTLSStack) String() string {
+	return fmt.Sprintf("openssl-sys %s / rustls %s",
+		strings.Join(s.OpenSSLSys, "+"), strings.Join(s.Rustls, "+"))
+}
+
+// fetchCodexTLSStack reads the TLS dependency versions for a release tag such as
+// "rust-v0.155.0". An HTTP or parse failure is not fatal: the caller keeps the
+// current version and simply cannot tell whether a re-capture is due.
+func fetchCodexTLSStack(ctx context.Context, tag string) (codexTLSStack, error) {
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		return codexTLSStack{}, errors.New("empty release tag")
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, codexVersionFetchTimeout)
+	defer cancel()
+
+	req, errRequest := http.NewRequestWithContext(reqCtx, http.MethodGet, fmt.Sprintf(codexLockURLTemplate, tag), nil)
+	if errRequest != nil {
+		return codexTLSStack{}, fmt.Errorf("build request: %w", errRequest)
+	}
+	resp, errDo := (&http.Client{Timeout: codexVersionFetchTimeout}).Do(req)
+	if errDo != nil {
+		return codexTLSStack{}, fmt.Errorf("request: %w", errDo)
+	}
+	defer func() {
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.Debugf("codex version: close Cargo.lock response: %v", errClose)
+		}
+	}()
+	if resp.StatusCode != http.StatusOK {
+		return codexTLSStack{}, fmt.Errorf("status %d", resp.StatusCode)
+	}
+	body, errRead := io.ReadAll(io.LimitReader(resp.Body, maxCodexLockBody))
+	if errRead != nil {
+		return codexTLSStack{}, fmt.Errorf("read body: %w", errRead)
+	}
+	return parseCodexTLSStack(body)
+}
+
+// parseCodexTLSStack pulls the two versions that decide the ClientHello shape
+// out of a Cargo.lock document.
+func parseCodexTLSStack(body []byte) (codexTLSStack, error) {
+	var stack codexTLSStack
+	for _, match := range codexLockPackagePattern.FindAllSubmatch(body, -1) {
+		version := string(match[2])
+		switch string(match[1]) {
+		case "openssl-sys":
+			stack.OpenSSLSys = append(stack.OpenSSLSys, version)
+		case "rustls":
+			stack.Rustls = append(stack.Rustls, version)
+		}
+	}
+	if len(stack.OpenSSLSys) == 0 && len(stack.Rustls) == 0 {
+		return codexTLSStack{}, errors.New("neither openssl-sys nor rustls found")
+	}
+	return stack, nil
+}
+
 const (
 	// The releases page redirects to the tag, so the tag can be read without the
 	// API's rate limit. codexReleaseAPIPath is the fallback.
@@ -36,9 +146,8 @@ const (
 	codexVersionFetchTimeout = 15 * time.Second
 	// Daily. Polling more often buys very little: a version a few hours behind is
 	// indistinguishable from a real user who has not upgraded yet, and real users
-	// lag by days. What genuinely has to keep up is the TLS profile, and that
-	// cannot be polled for at all — see the drift warning in
-	// SetCodexClientVersion, which is the signal that actually matters.
+	// lag by days. The same pass also re-reads the release's TLS stack, which is
+	// what actually decides whether a re-capture is due.
 	codexVersionRefreshInterval = 24 * time.Hour
 	maxCodexReleaseBody         = 1 << 20
 )
@@ -84,11 +193,12 @@ func SetCodexClientVersion(version string) {
 	codexClientVersion.Store(version)
 
 	if version != CodexProfileVersion {
-		if _, warned := codexDriftWarned.LoadOrStore(version, struct{}{}); !warned {
-			log.Warnf("codex: upstream released %s but the TLS profile was captured from %s; "+
-				"re-capture with tools/codexfp (see tools/codexfp/README.md) so the handshake matches the advertised version",
-				version, CodexProfileVersion)
-		}
+		// No warning here. A new release does not mean the profile is stale: the
+		// TLS stack moves far more slowly than the release cadence, and warning on
+		// every release produces noise that gets ignored. refreshCodexVersion
+		// reads the stack itself and warns only when the profiles really are out
+		// of date.
+		log.Infof("codex: advertising %s, profile captured from %s", version, CodexProfileVersion)
 	}
 }
 
@@ -134,10 +244,34 @@ func refreshCodexVersion(ctx context.Context, label string) {
 	}
 	if CodexClientVersion() == version {
 		log.Infof("%s completed from %s, already at %s", label, source, version)
+	} else {
+		SetCodexClientVersion(version)
+		log.Infof("%s completed from %s, now advertising %s", label, source, version)
+	}
+	warnIfCodexTLSStackDrifted(ctx, version)
+}
+
+// warnIfCodexTLSStackDrifted reports when a release's TLS dependencies no longer
+// match the ones the captured profiles came from.
+//
+// This, not the release version, is the signal that a re-capture is due. It
+// costs one Cargo.lock fetch, and a lookup failure only means the check could
+// not run — never that the profile is fine.
+func warnIfCodexTLSStackDrifted(ctx context.Context, version string) {
+	stack, errStack := fetchCodexTLSStack(ctx, "rust-v"+version)
+	if errStack != nil {
+		log.Debugf("codex: could not read the TLS stack for %s: %v", version, errStack)
 		return
 	}
-	SetCodexClientVersion(version)
-	log.Infof("%s completed from %s, now advertising %s", label, source, version)
+	if stack.matchesProfile() {
+		return
+	}
+	if _, warned := codexDriftWarned.LoadOrStore(version, struct{}{}); warned {
+		return
+	}
+	log.Warnf("codex: %s ships %s, but the TLS profiles were captured from openssl-sys %s / rustls %s; "+
+		"re-capture with tools/codexfp (see tools/codexfp/README.md)",
+		version, stack, codexProfileOpenSSLSys, codexProfileRustls)
 }
 
 func fetchLatestCodexVersion(ctx context.Context) (string, string, error) {

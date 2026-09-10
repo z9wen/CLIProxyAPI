@@ -77,3 +77,71 @@ func TestCodexProfileVersionIsValid(t *testing.T) {
 		t.Fatal("CodexClientVersion() is empty")
 	}
 }
+
+// The ClientHello profile only moves with the TLS stack, so the Cargo.lock check
+// is what decides when a re-capture is due — not the release version.
+func TestParseCodexTLSStack(t *testing.T) {
+	t.Parallel()
+
+	lock := []byte(`[[package]]
+name = "openssl-sys"
+version = "0.9.111"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "reqwest"
+version = "0.12.28"
+
+[[package]]
+name = "rustls"
+version = "0.23.36"
+`)
+
+	stack, err := parseCodexTLSStack(lock)
+	if err != nil {
+		t.Fatalf("parseCodexTLSStack: %v", err)
+	}
+	if want := "openssl-sys 0.9.111 / rustls 0.23.36"; stack.String() != want {
+		t.Fatalf("stack = %q, want %q", stack, want)
+	}
+	if !stack.matchesProfile() {
+		t.Fatal("the shipped pins must match the release this profile was captured from")
+	}
+}
+
+func TestParseCodexTLSStackDetectsDrift(t *testing.T) {
+	t.Parallel()
+
+	// A rustls bump is exactly the event that invalidates the captured profile.
+	lock := []byte("[[package]]\nname = \"rustls\"\nversion = \"0.24.0\"\n")
+	stack, err := parseCodexTLSStack(lock)
+	if err != nil {
+		t.Fatalf("parseCodexTLSStack: %v", err)
+	}
+	if stack.matchesProfile() {
+		t.Fatal("a rustls bump must not match the captured profile")
+	}
+}
+
+// A lock that carries both the old and the new crate during an upgrade must not
+// be read as "the pinned version is present, so nothing changed".
+func TestParseCodexTLSStackTreatsMultipleVersionsAsDrift(t *testing.T) {
+	t.Parallel()
+
+	lock := []byte("[[package]]\nname = \"rustls\"\nversion = \"0.23.36\"\n\n[[package]]\nname = \"rustls\"\nversion = \"0.24.0\"\n")
+	stack, err := parseCodexTLSStack(lock)
+	if err != nil {
+		t.Fatalf("parseCodexTLSStack: %v", err)
+	}
+	if stack.matchesProfile() {
+		t.Fatal("a lock resolving two rustls versions must count as drift")
+	}
+}
+
+func TestParseCodexTLSStackRejectsUnrelatedDocument(t *testing.T) {
+	t.Parallel()
+
+	if _, err := parseCodexTLSStack([]byte("# not a lock file\n")); err == nil {
+		t.Fatal("a document with neither dependency must be rejected, not silently matched")
+	}
+}
