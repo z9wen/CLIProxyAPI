@@ -61,8 +61,14 @@ func TestMiddlewareSetsSupportPluginHeader(t *testing.T) {
 		if rec.Code != http.StatusUnauthorized {
 			t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
 		}
-		if got := rec.Header().Get("X-CPA-SUPPORT-PLUGIN"); got != pluginhost.SupportPluginHeaderValue() {
-			t.Fatalf("X-CPA-SUPPORT-PLUGIN = %q, want %q", got, pluginhost.SupportPluginHeaderValue())
+		// None of the build identifiers may ride along with a rejection: anyone
+		// probing the path would otherwise learn the exact version to match
+		// against known advisories. The control panel is unaffected — it only
+		// reads these from responses to its own authenticated calls.
+		for _, headerName := range []string{"X-CPA-SUPPORT-PLUGIN", "X-CPA-VERSION", "X-CPA-COMMIT", "X-CPA-BUILD-DATE"} {
+			if got := rec.Header().Get(headerName); got != "" {
+				t.Fatalf("%s = %q on a rejected request, want it unset", headerName, got)
+			}
 		}
 	})
 

@@ -27,10 +27,25 @@ const (
 	codexResponsesWebsocketHandshakeTO     = 30 * time.Second
 )
 
-func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *cliproxyauth.Auth, wsURL string, headers http.Header) (*websocket.Conn, *websocketConnectionCloser, *http.Response, error) {
-	dialer := newProxyAwareWebsocketDialer(e.cfg, auth)
+// newCodexWebsocketDialer builds the dialer for the upstream handshake.
+//
+// Proxy is deliberately cleared even when one is configured. gorilla wraps
+// NetDialTLSContext with a CONNECT dialer when Proxy is set, and that dialer
+// calls it with the *proxy's* address, expecting a plain TCP connection to
+// tunnel through. Our dial function performs the TLS handshake instead, so it
+// owns the CONNECT itself and must see the real target address — otherwise the
+// handshake goes to the proxy and the ClientHello loses its SNI.
+func newCodexWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *websocket.Dialer {
+	dialer := newProxyAwareWebsocketDialer(cfg, auth)
 	dialer.HandshakeTimeout = codexResponsesWebsocketHandshakeTO
 	dialer.EnableCompression = true
+	dialer.NetDialTLSContext = helps.CodexWebsocketTLSDialContext(codexWebsocketProxyURL(cfg, auth))
+	dialer.Proxy = nil
+	return dialer
+}
+
+func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *cliproxyauth.Auth, wsURL string, headers http.Header) (*websocket.Conn, *websocketConnectionCloser, *http.Response, error) {
+	dialer := newCodexWebsocketDialer(e.cfg, auth)
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -157,6 +172,19 @@ func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession,
 	}
 }
 
+// codexWebsocketProxyURL resolves the credential proxy, then the config proxy.
+func codexWebsocketProxyURL(cfg *config.Config, auth *cliproxyauth.Auth) string {
+	if auth != nil {
+		if proxyURL := strings.TrimSpace(auth.ProxyURL); proxyURL != "" {
+			return proxyURL
+		}
+	}
+	if cfg != nil {
+		return strings.TrimSpace(cfg.ProxyURL)
+	}
+	return ""
+}
+
 func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *websocket.Dialer {
 	dialer := &websocket.Dialer{
 		Proxy:             http.ProxyFromEnvironment,
@@ -168,13 +196,7 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 		}).DialContext,
 	}
 
-	proxyURL := ""
-	if auth != nil {
-		proxyURL = strings.TrimSpace(auth.ProxyURL)
-	}
-	if proxyURL == "" && cfg != nil {
-		proxyURL = strings.TrimSpace(cfg.ProxyURL)
-	}
+	proxyURL := codexWebsocketProxyURL(cfg, auth)
 	if proxyURL == "" {
 		return dialer
 	}

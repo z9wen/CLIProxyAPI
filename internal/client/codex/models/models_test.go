@@ -374,12 +374,12 @@ func TestApplyCodexClientModelMetadataPreservesMultiAgentVersionWhenDisabled(t *
 	entry := map[string]any{"multi_agent_version": "v1"}
 	model := map[string]any{"id": "custom-model"}
 
-	applyCodexClientModelMetadata(entry, "custom-model", model, false, "")
+	applyCodexClientModelMetadata(entry, "custom-model", model, false, "", nil)
 	if got := entry["multi_agent_version"]; got != "v1" {
 		t.Fatalf("disabled multi_agent_version = %#v, want preserved v1", got)
 	}
 
-	applyCodexClientModelMetadata(entry, "custom-model", model, true, "")
+	applyCodexClientModelMetadata(entry, "custom-model", model, true, "", nil)
 	if got := entry["multi_agent_version"]; got != "v2" {
 		t.Fatalf("enabled multi_agent_version = %#v, want v2", got)
 	}
@@ -587,6 +587,38 @@ func TestSanitizeCodexClientReasoningMetadataPreservesEmptyArray(t *testing.T) {
 			}
 			if got, want := string(encodedEntry), `{"supported_reasoning_levels":[]}`; got != want {
 				t.Fatalf("model metadata JSON = %s, want %s", got, want)
+			}
+		})
+	}
+}
+
+// A codex-backed model must keep apply_patch_tool_type, or the client stops
+// registering the apply_patch tool and edits fall back to shell heredocs.
+func TestApplyCodexClientModelMetadataKeepsApplyPatchForCodexOnlyModels(t *testing.T) {
+	t.Parallel()
+
+	codexOnly := func(string) []string { return []string{"codex"} }
+	mixed := func(string) []string { return []string{"codex", "gemini"} }
+	none := func(string) []string { return nil }
+
+	tests := []struct {
+		name          string
+		providers     ProvidersForModelFunc
+		wantApplyPatc bool
+	}{
+		{name: "codex only keeps the field", providers: codexOnly, wantApplyPatc: true},
+		{name: "mixed providers drop it", providers: mixed, wantApplyPatc: false},
+		{name: "no providers drop it", providers: none, wantApplyPatc: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			entry := map[string]any{"apply_patch_tool_type": "freeform"}
+			applyCodexClientModelMetadata(entry, "custom-model", map[string]any{"id": "custom-model"}, false, "", tt.providers)
+			_, present := entry["apply_patch_tool_type"]
+			if present != tt.wantApplyPatc {
+				t.Fatalf("apply_patch_tool_type present = %v, want %v", present, tt.wantApplyPatc)
 			}
 		})
 	}

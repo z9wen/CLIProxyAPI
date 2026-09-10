@@ -19,6 +19,7 @@ import (
 	codexmodels "github.com/router-for-me/CLIProxyAPI/v7/internal/client/codex/models"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/client/grokbuild"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -51,7 +52,16 @@ func (s *Server) setupRoutes() {
 	s.engine.GET("/healthz", healthzHandler)
 	s.engine.HEAD("/healthz", healthzHandler)
 
-	s.engine.GET("/management.html", s.serveManagementControlPanel)
+	// The panel path is configurable so it stays off the fixed-path wordlists
+	// bulk scanners use; see remote-management.panel-path.
+	panelPath := config.DefaultManagementPanelPath
+	if s.cfg != nil {
+		panelPath = s.cfg.ManagementPanelPath()
+	}
+	s.engine.GET("/"+panelPath, s.serveManagementControlPanel)
+	if panelPath != config.DefaultManagementPanelPath {
+		log.Infof("management control panel served at /%s", panelPath)
+	}
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	claudeCodeHandlers := claude.NewClaudeCodeAPIHandler(s.handlers)
@@ -115,7 +125,21 @@ func (s *Server) setupRoutes() {
 		codexDirect.POST("/responses", openaiResponsesHandlers.Responses)
 		codexDirect.POST("/responses/compact", openaiResponsesHandlers.Compact)
 		codexDirect.POST("/alpha/search", s.codexAlphaSearch)
+		// The client resolves these against its provider base URL, which is
+		// .../backend-api/codex whenever chatgpt_base_url is in play. Without the
+		// aliases a client on that base gets a 404 for the model catalog, the
+		// image tools and voice, even though every handler already exists under
+		// /v1. The catalog 404 is the costly one: the client silently falls back
+		// to its bundled model list, so none of the catalog work here — the
+		// auth-aware search gate, the visibility overrides, the multi-agent
+		// version — reaches it.
+		codexDirect.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
+		codexDirect.POST("/images/generations", openaiHandlers.ImagesGenerations)
+		codexDirect.POST("/images/edits", openaiHandlers.ImagesEdits)
 	}
+	// realtime/calls carries its own auth middleware rather than the API-key one,
+	// so it is registered on the engine instead of inside the group.
+	s.engine.POST("/backend-api/codex/realtime/calls", realtimeAuth, s.codexLiveHandler.Handle)
 
 	// Gemini compatible API routes
 	v1beta := s.engine.Group("/v1beta")
@@ -127,10 +151,12 @@ func (s *Server) setupRoutes() {
 		v1beta.GET("/models/*action", s.geminiGetHandler(geminiHandlers))
 	}
 
-	// Root endpoint
+	// Root endpoint. It deliberately does not name the software: this path is the
+	// first thing anything scanning the port asks for, and a product name there is
+	// enough to classify the deployment and look up its advisories. The endpoint
+	// list is just the OpenAI-compatible surface, which many gateways share.
 	s.engine.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
-			"message": "CLI Proxy API Server",
 			"endpoints": []string{
 				"POST /v1/chat/completions",
 				"POST /v1/completions",

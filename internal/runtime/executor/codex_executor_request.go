@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/klauspost/compress/zstd"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -18,17 +20,37 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
 const (
-	codexUserAgent             = "codex-tui/0.153.3 (Mac OS 26.5.1; arm64) iTerm.app/3.6.11 (codex-tui; 0.153.3)"
-	codexOriginator            = "codex-tui"
+	// codexOriginator is the interactive TUI's originator, which is the client
+	// this proxy stands in for. The process-wide default is codex_cli_rs; the
+	// `codex exec` subcommand overrides it to codex_exec, and the app server
+	// takes one from its caller.
+	codexOriginator = "codex_cli_rs"
+	// codexPlatform is the OS/arch/terminal triple the identity claims, captured
+	// from the official Linux build. os_info normalises an Ubuntu VERSION_ID of
+	// "26.04" to "26.4.0".
+	codexPlatform              = "(Ubuntu 26.4.0; x86_64) xterm-256color"
 	codexDefaultImageToolModel = "gpt-image-2"
 	codexResponsesLiteHeader   = "X-OpenAI-Internal-Codex-Responses-Lite"
 	codexResponsesLiteMetadata = "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite"
 )
+
+// codexUserAgent builds the client's User-Agent:
+//
+//	{originator}/{version} ({os} {os_version}; {arch}) {terminal} ({client}; {version})
+//
+// The version comes from the registry rather than a constant so an upstream
+// release moves the whole identity without a code change; the trailing group is
+// the USER_AGENT_SUFFIX the app server sets from its client name.
+func codexUserAgent() string {
+	version := registry.CodexClientVersion()
+	return codexOriginator + "/" + version + " " + codexPlatform + " (codex-tui; " + version + ")"
+}
 
 var dataTag = []byte("data:")
 
@@ -151,7 +173,9 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 		return nil, nil, codexIdentityConfuseState{}, err
 	}
 	if cache.ID != "" {
-		httpReq.Header.Set("Session-Id", cache.ID)
+		// Set the literal spelling, not Go's canonical Session-Id: the client
+		// sends lowercase and the map should not disagree with the wire.
+		setHeaderCasePreserved(httpReq.Header, "session-id", cache.ID)
 	}
 	return httpReq, rawJSON, identityState, nil
 }
@@ -197,13 +221,12 @@ func applyCodexIdentityConfuseHeaders(headers http.Header, state *codexIdentityC
 		return
 	}
 
-	setCodexSessionHeaderCasePreserved(headers, "Session-Id", state.promptCacheKey)
-	if headerValueCaseInsensitive(headers, "Conversation_id") != "" {
-		setHeaderCasePreserved(headers, "Conversation_id", state.promptCacheKey)
-	}
-	headers.Set("X-Client-Request-Id", state.promptCacheKey)
-	headers.Set("Thread-Id", state.promptCacheKey)
-	headers.Set("X-Codex-Window-Id", state.promptCacheKey+":0")
+	// The real client sends session-id and thread-id hyphenated and lowercase,
+	// and sends no conversation_id header at all.
+	setHeaderCasePreserved(headers, "session-id", state.promptCacheKey)
+	headers.Set("x-client-request-id", state.promptCacheKey)
+	headers.Set("thread-id", state.promptCacheKey)
+	headers.Set("x-codex-window-id", state.promptCacheKey+":0")
 }
 
 func applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata string, state *codexIdentityConfuseState) string {
@@ -301,7 +324,7 @@ func applyModelHeaderOverrides(headers http.Header, modelName string) {
 		headers.Set(key, value)
 	}
 	if strings.Contains(headers.Get("User-Agent"), "Mac OS") && codexSessionHeaderValue(headers) == "" {
-		headers.Set("Session_id", uuid.NewString())
+		headers.Set("session-id", uuid.NewString())
 	}
 }
 
@@ -334,19 +357,20 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Window-Id", "")
-	misc.EnsureHeader(r.Header, ginHeaders, "Thread-Id", "")
-	misc.EnsureHeader(r.Header, ginHeaders, "Session-Id", "")
+	ensureHeaderCasePreserved(r.Header, ginHeaders, "thread-id", "", "")
+	ensureHeaderCasePreserved(r.Header, ginHeaders, "session-id", "", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Openai-Internal-Codex-Responses-Lite", "")
 
 	cfgUserAgent, _ := codexHeaderDefaults(cfg, auth)
-	ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
+	ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent())
 
 	if stream {
 		r.Header.Set("Accept", "text/event-stream")
 	} else {
 		r.Header.Set("Accept", "application/json")
 	}
-	r.Header.Set("Connection", "Keep-Alive")
+	// The real client sends no Connection header: HTTP/1.1 is persistent by
+	// default, and the upstream would only ever see this on h1.
 
 	isAPIKey := codexAuthUsesAPIKey(auth)
 	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
@@ -373,8 +397,85 @@ func applyCodexCloakingHeaders(headers http.Header, cfg *config.Config) {
 	if headers == nil || cfg == nil || cfg.Codex.DisableCodexCloaking {
 		return
 	}
-	headers.Set("User-Agent", codexUserAgent)
+	headers.Set("User-Agent", codexUserAgent())
 	headers.Set("Originator", codexOriginator)
+	// The built-in OpenAI provider always carries its own version here
+	// (model-provider-info: create_openai_provider), and leaving it out while
+	// user-agent and originator both advertise one is an incoherent identity.
+	headers.Set("Version", registry.CodexClientVersion())
+}
+
+// codexZstdEncoder is built once: encoder construction allocates compression
+// tables and the level never changes. EncodeAll is safe for concurrent use.
+var codexZstdEncoder = func() *zstd.Encoder {
+	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
+	if err != nil {
+		log.Warnf("codex request compression: build zstd encoder: %v", err)
+		return nil
+	}
+	return encoder
+}()
+
+// applyCodexRequestCompression replaces the request body with its zstd encoding,
+// matching what the real client sends on the ChatGPT backend, and returns the
+// body that will actually go on the wire.
+//
+// The client gates this on uses_codex_backend(), which excludes API-key and
+// custom-base-url requests, and the enable_request_compression feature it sits
+// behind defaults to on. Using the same gate here also means a third-party relay
+// that expects plain JSON keeps working, since those are reached by API key.
+//
+// Call this before the request is logged: the recorded headers and body are
+// meant to describe what the upstream received, and compressing afterwards would
+// leave the log showing a plaintext body with no content-encoding.
+func applyCodexRequestCompression(cfg *config.Config, auth *cliproxyauth.Auth, httpReq *http.Request, body []byte) []byte {
+	if cfg != nil && cfg.Codex.DisableRequestCompression {
+		return body
+	}
+	if httpReq == nil || len(body) == 0 || codexAuthUsesAPIKey(auth) {
+		return body
+	}
+	// Only the main responses endpoint. /responses/compact and the image
+	// endpoints are left alone, as the client does.
+	if !strings.HasSuffix(strings.TrimSuffix(httpReq.URL.Path, "/"), "/responses") {
+		return body
+	}
+	if codexZstdEncoder == nil {
+		return body
+	}
+
+	compressed := codexZstdEncoder.EncodeAll(body, nil)
+	httpReq.Body = io.NopCloser(bytes.NewReader(compressed))
+	httpReq.ContentLength = int64(len(compressed))
+	httpReq.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(compressed)), nil
+	}
+	httpReq.Header.Set("Content-Encoding", "zstd")
+	return compressed
+}
+
+// applyCodexRoutingHint sets x-codex-routing-hint, which the real client sends on
+// the ChatGPT backend to tell the router which model a turn is for.
+//
+// The value mirrors the request's own model, so the hint cannot disagree with the
+// body. Same gate as the client: ChatGPT auth, and the /responses endpoint only —
+// not /responses/compact, and not the Guardian endpoint.
+func applyCodexRoutingHint(httpReq *http.Request, auth *cliproxyauth.Auth, model string, body []byte) {
+	if httpReq == nil || codexAuthUsesAPIKey(auth) {
+		return
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return
+	}
+	if !strings.HasSuffix(strings.TrimSuffix(httpReq.URL.Path, "/"), "/responses") {
+		return
+	}
+	hint := "model=" + model
+	if tier := strings.TrimSpace(gjson.GetBytes(body, "service_tier").String()); tier != "" {
+		hint += ";tier=" + tier
+	}
+	httpReq.Header.Set("x-codex-routing-hint", hint)
 }
 
 func normalizeCodexInstructions(body []byte) []byte {

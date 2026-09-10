@@ -768,6 +768,11 @@ func modelCatalogUpdaterPlan(localModel, homeEnabled bool) (startModels, startCo
 }
 
 func startModelCatalogUpdaters(localModel, homeEnabled bool) {
+	// The Codex wire identity tracks upstream releases regardless of the model
+	// catalog policy: a version left behind by a forgotten manual bump is a
+	// fingerprint of its own, and it says nothing about which models to serve.
+	registry.StartCodexVersionUpdater(context.Background())
+
 	startModels, startCodexClient := modelCatalogUpdaterPlan(localModel, homeEnabled)
 	if startCodexClient {
 		registry.StartCodexClientModelsUpdater(context.Background())

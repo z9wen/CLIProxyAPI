@@ -129,6 +129,15 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 
 	// Create gin engine
 	engine := gin.New()
+	// gin trusts every peer by default, which lets any client claim a loopback
+	// address through X-Forwarded-For and be treated as a local caller. Trust
+	// only what the operator names; see the TrustedProxies config comment.
+	if errProxies := engine.SetTrustedProxies(cfg.TrustedProxies); errProxies != nil {
+		log.WithError(errProxies).Warn("invalid trusted-proxies entries; trusting no proxy, so client IPs will be the direct peer")
+		if errClear := engine.SetTrustedProxies(nil); errClear != nil {
+			log.WithError(errClear).Warn("failed to clear trusted proxies")
+		}
+	}
 	if optionState.engineConfigurator != nil {
 		optionState.engineConfigurator(engine)
 	}

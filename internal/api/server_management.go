@@ -296,6 +296,15 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
 	}
+	// The panel is part of the management surface, so it follows the same
+	// allow-remote rule as the API. It used to be served to anyone who could
+	// reach the port, which meant a deployment that had explicitly disabled
+	// remote management still handed its admin UI to remote callers. 404 rather
+	// than 403 so a remote probe learns nothing about what lives here.
+	if s.mgmt == nil || !s.mgmt.ManagementAccessAllowed(c.ClientIP()) {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
 	filePath := managementasset.FilePath(s.configFilePath)
 	if strings.TrimSpace(filePath) == "" {
 		c.AbortWithStatus(http.StatusNotFound)

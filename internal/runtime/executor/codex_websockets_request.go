@@ -57,8 +57,9 @@ func applyCodexPromptCacheHeadersWithContext(ctx context.Context, from sdktransl
 
 	if cache.ID != "" {
 		rawJSON = helps.SetStringIfDifferent(rawJSON, "prompt_cache_key", cache.ID)
-		setHeaderCasePreserved(headers, "session_id", cache.ID)
-		headers.Set("Conversation_id", cache.ID)
+		// The real handshake sends session-id hyphenated and lowercase, and no
+		// conversation_id header.
+		setHeaderCasePreserved(headers, "session-id", cache.ID)
 	}
 
 	return rawJSON, headers, nil
@@ -92,7 +93,7 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	if isAPIKey {
 		ensureHeaderWithPriority(headers, ginHeaders, "User-Agent", "", "")
 	} else {
-		ensureHeaderWithConfigPrecedence(headers, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
+		ensureHeaderWithConfigPrecedence(headers, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent())
 	}
 
 	betaHeader := strings.TrimSpace(headers.Get("OpenAI-Beta"))
@@ -145,14 +146,22 @@ func ensureCodexWebsocketSessionHeader(target http.Header, source http.Header, f
 	if sessionID == "" {
 		sessionID = strings.TrimSpace(fallbackValue)
 	}
+	// Always write the client's spelling, whatever the downstream caller used.
+	// The underscore spellings are dropped first: setHeaderCasePreserved already
+	// clears case-insensitive matches of session-id, which includes Session-Id,
+	// so deleting that after the write would remove what was just set.
 	if sessionID != "" {
-		setHeaderCasePreserved(target, "session_id", sessionID)
+		deleteHeaderCaseInsensitive(target, "Session_id")
+		deleteHeaderCaseInsensitive(target, "session_id")
+		setHeaderCasePreserved(target, "session-id", sessionID)
 	}
-	deleteHeaderCaseInsensitive(target, "Session-Id")
 }
 
+// codexSessionHeaderValue reads the session id from whichever spelling the
+// downstream client used. Reading stays lenient; only the outgoing spelling is
+// pinned.
 func codexSessionHeaderValue(headers http.Header) string {
-	for _, key := range []string{"Session-Id", "Session_id", "session_id"} {
+	for _, key := range []string{"session-id", "Session-Id", "Session_id", "session_id"} {
 		if value := strings.TrimSpace(headerValueCaseInsensitive(headers, key)); value != "" {
 			return value
 		}

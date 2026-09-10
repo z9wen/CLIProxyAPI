@@ -166,6 +166,10 @@ type CodexConfig struct {
 	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
 	// DisableCodexCloaking disables forcing the official Codex identity headers on HTTP/SSE and WebSocket requests.
 	DisableCodexCloaking bool `yaml:"disable-codex-cloaking" json:"disable-codex-cloaking"`
+	// DisableRequestCompression stops zstd-compressing /responses request bodies.
+	// The real client compresses them by default on the ChatGPT backend; turn this
+	// off only for an upstream that does not accept content-encoding: zstd.
+	DisableRequestCompression bool `yaml:"disable-request-compression" json:"disable-request-compression"`
 	// StreamBootstrapBuffering holds back initial handshake events (response.created,
 	// response.in_progress and the websocket metadata frames) until the first generated event
 	// arrives. The upstream delivers server_is_overloaded rejections inside an HTTP 200 stream
@@ -235,6 +239,14 @@ type RemoteManagement struct {
 	// PanelGitHubRepository overrides the GitHub repository used to fetch the management panel asset.
 	// Accepts either a repository URL (https://github.com/org/repo) or an API releases endpoint.
 	PanelGitHubRepository string `yaml:"panel-github-repository"`
+	// PanelPath is the path the control panel is served at. Defaults to
+	// "management.html". A single path segment ending in .html.
+	//
+	// Renaming it keeps the panel off the fixed-path wordlists bulk scanners
+	// use. That is friction, not an access control boundary: the boundary is
+	// secret-key plus allow-remote. Reachability follows allow-remote either
+	// way, and disable-control-panel remains the way to turn the panel off.
+	PanelPath string `yaml:"panel-path"`
 }
 
 // QuotaExceeded defines the behavior when API quota limits are exceeded.

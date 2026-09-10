@@ -13,6 +13,21 @@ type Config struct {
 	// Port is the network port on which the API server will listen.
 	Port int `yaml:"port" json:"-"`
 
+	// TrustedProxies lists the network origins whose forwarding headers are
+	// believed when resolving the client IP. Entries may be IPs or CIDRs.
+	//
+	// Empty means trust nobody, which is the default and the safe choice. gin
+	// otherwise trusts every peer, so any client could send
+	// "X-Forwarded-For: 127.0.0.1" and be treated as a local caller — bypassing
+	// allow-remote-management, unlocking the local-password path, and defeating
+	// the failed-attempt ban, which is keyed by client IP.
+	//
+	// Set this to your reverse proxy's address or network (a Docker bridge
+	// subnet, say) so real client IPs reach the management controls. The proxy
+	// must be the ONLY way to reach this server; otherwise a client can skip it
+	// and forge the header directly, which this setting cannot detect.
+	TrustedProxies []string `yaml:"trusted-proxies" json:"trusted-proxies"`
+
 	// TLS config controls HTTPS server settings.
 	TLS TLSConfig `yaml:"tls" json:"tls"`
 

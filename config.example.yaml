@@ -5,6 +5,18 @@ host: ""
 # Server port
 port: 8317
 
+# Network origins whose forwarding headers are believed when resolving the client IP.
+# Entries may be IPs or CIDRs. Empty (the default) trusts nobody, which is the safe
+# choice: gin otherwise trusts every peer, so any client could send
+# "X-Forwarded-For: 127.0.0.1" and be treated as a local caller -- bypassing
+# allow-remote, unlocking the local-password path, and defeating the failed-attempt
+# ban, which is keyed by client IP.
+# Set this to your reverse proxy's address or network (a Docker bridge subnet, say).
+# The proxy must be the ONLY way to reach this server; otherwise a client can skip it
+# and forge the header directly.
+# trusted-proxies:
+#   - "172.16.0.0/12"
+
 # TLS settings for HTTPS. When enabled, the server listens with the provided certificate and key.
 tls:
   enable: false
@@ -31,6 +43,12 @@ remote-management:
 
   # GitHub repository for the management control panel. Accepts a repository URL or releases API URL.
   panel-github-repository: "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
+
+  # Path the control panel is served at. Defaults to "management.html".
+  # Renaming it keeps the panel off the fixed-path wordlists bulk scanners use.
+  # That is friction, not an access control boundary: reachability still follows
+  # allow-remote, and disable-control-panel remains the way to turn the panel off.
+  # panel-path: "console.html"
 
 # Authentication directory (supports ~ for home directory)
 auth-dir: "~/.cli-proxy-api"
@@ -246,6 +264,11 @@ codex:
   identity-confuse: false
   # Disable forcing the official Codex User-Agent and Originator headers on HTTP/SSE and WebSocket requests.
   disable-codex-cloaking: false
+  # Stop zstd-compressing /responses request bodies. The real client compresses them by
+  # default on the ChatGPT backend, and API-key or custom-base-url requests are left
+  # uncompressed either way, so this is only for an upstream that rejects
+  # content-encoding: zstd.
+  # disable-request-compression: false
   # Hold back the initial handshake events (response.created, response.in_progress and the
   # websocket metadata frames) until the upstream emits its first generated event.
   # Why: the upstream smuggles `server_is_overloaded` rejections *inside* an HTTP 200 stream,

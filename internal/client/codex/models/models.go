@@ -89,7 +89,7 @@ func buildCodexClientModels(models []map[string]any, providersForModel Providers
 		}
 
 		entry := cloneCodexClientModelMap(defaultTemplate)
-		applyCodexClientModelMetadata(entry, id, model, optimizeMultiAgentV2, clientVersion)
+		applyCodexClientModelMetadata(entry, id, model, optimizeMultiAgentV2, clientVersion, providersForModel)
 		applyCodexClientMaxTokens(entry, model)
 		applyCodexClientSearchToolSupport(entry, id, false, providersForModel)
 		sanitizeCodexClientReasoningMetadata(entry, clientVersion)
@@ -217,6 +217,26 @@ func applyCodexClientMaxTokens(entry map[string]any, model map[string]any) {
 	}
 }
 
+// codexOnlyProviders reports whether a slug is served exclusively by codex.
+// A nil lookup, an unknown slug, or an empty provider list all count as false,
+// so a capability is dropped rather than advertised for a model that cannot
+// honour it.
+func codexOnlyProviders(id string, providersForModel ProvidersForModelFunc) bool {
+	if providersForModel == nil {
+		return false
+	}
+	providers := providersForModel(id)
+	if len(providers) == 0 {
+		return false
+	}
+	for _, provider := range providers {
+		if !strings.EqualFold(strings.TrimSpace(provider), "codex") {
+			return false
+		}
+	}
+	return true
+}
+
 func applyCodexClientSearchToolSupport(entry map[string]any, id string, templateModel bool, providersForModel ProvidersForModelFunc) {
 	supportsSearch, _ := entry["supports_search_tool"].(bool)
 	if !supportsSearch {
@@ -227,25 +247,18 @@ func applyCodexClientSearchToolSupport(entry map[string]any, id string, template
 		entry["supports_search_tool"] = false
 		return
 	}
-
+	// A nil lookup means provider information is unavailable at all, which is
+	// different from "no providers for this slug". A known template keeps the
+	// catalog's claim in that case.
 	if providersForModel == nil {
 		return
 	}
-
-	providers := providersForModel(id)
-	if len(providers) == 0 {
+	if !codexOnlyProviders(id, providersForModel) {
 		entry["supports_search_tool"] = false
-		return
-	}
-	for _, provider := range providers {
-		if !strings.EqualFold(strings.TrimSpace(provider), "codex") {
-			entry["supports_search_tool"] = false
-			return
-		}
 	}
 }
 
-func applyCodexClientModelMetadata(entry map[string]any, id string, model map[string]any, optimizeMultiAgentV2 bool, clientVersion string) {
+func applyCodexClientModelMetadata(entry map[string]any, id string, model map[string]any, optimizeMultiAgentV2 bool, clientVersion string, providersForModel ProvidersForModelFunc) {
 	info := registry.LookupModelInfo(id)
 
 	displayName := stringModelValue(model, "display_name")
@@ -295,7 +308,15 @@ func applyCodexClientModelMetadata(entry map[string]any, id string, model map[st
 		entry["multi_agent_version"] = "v2"
 	}
 	entry["service_tiers"] = []any{}
-	delete(entry, "apply_patch_tool_type")
+	// apply_patch is a freeform tool the Codex backend serves. A model backed by
+	// anything else would advertise a tool the target cannot represent, so the
+	// field is kept only where every provider for the slug is codex — the same
+	// rule the search gate uses. Dropping it unconditionally took the tool away
+	// from codex-backed models too, leaving edits to fall back to shell
+	// heredocs.
+	if !codexOnlyProviders(id, providersForModel) {
+		delete(entry, "apply_patch_tool_type")
+	}
 	delete(entry, "upgrade")
 	delete(entry, "availability_nux")
 

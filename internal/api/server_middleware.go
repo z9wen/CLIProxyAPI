@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -8,22 +9,18 @@ import (
 	codexlive "github.com/router-for-me/CLIProxyAPI/v7/internal/client/codex/live"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/safemode"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	log "github.com/sirupsen/logrus"
 )
 
+// Only headers a cross-origin caller has a real reason to read. The X-CPA-* and
+// X-SERVER-* entries were removed: this list is emitted on every response, so
+// their names alone identified the software to anything that scanned the port,
+// even when no value was sent. The control panel does not need them here — it is
+// served from this same origin, so CORS never applies to it — and the build
+// headers are now only sent to authenticated callers anyway.
 var corsExposedResponseHeaders = []string{
-	logging.CPATraceIDHeader,
-	"X-CPA-VERSION",
-	"X-CPA-COMMIT",
-	"X-CPA-BUILD-DATE",
-	"X-CPA-SUPPORT-PLUGIN",
-	"X-CPA-HOME-VERSION",
-	"X-CPA-HOME-BUILD-DATE",
-	"X-SERVER-VERSION",
-	"X-SERVER-BUILD-DATE",
 	"Location",
 	"Retry-After",
 	"X-Request-Id",
@@ -32,10 +29,18 @@ var corsExposedResponseHeaders = []string{
 
 var corsExposedResponseHeadersJoined = strings.Join(corsExposedResponseHeaders, ", ")
 
-const (
-	exampleAPIKeyManagementPath = "/management.html"
-	exampleAPIKeyManagementURL  = "/management.html?safe-mode=configure"
-)
+// managementPanelPath is the path the control panel is served at, which is
+// configurable; see remote-management.panel-path.
+func (s *Server) managementPanelPath() string {
+	if s == nil || s.cfg == nil {
+		return config.DefaultManagementPanelPath
+	}
+	return s.cfg.ManagementPanelPath()
+}
+
+func (s *Server) managementPanelURL() string {
+	return "/" + s.managementPanelPath()
+}
 
 func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -45,7 +50,7 @@ func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 		}
 		if c != nil && c.Request != nil {
 			path := c.Request.URL.Path
-			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || strings.HasPrefix(path, "/v0/resource/plugins/") || path == "/management.html" {
+			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || strings.HasPrefix(path, "/v0/resource/plugins/") || path == s.managementPanelURL() {
 				c.Next()
 				return
 			}
@@ -71,11 +76,13 @@ func (s *Server) exampleAPIKeySafeModeMiddleware() gin.HandlerFunc {
 		}
 
 		path := c.Request.URL.Path
-		if path == exampleAPIKeyManagementPath && c.Query("safe-mode") == "configure" {
+		// URL.Path carries the leading slash, so compare against the URL form.
+		panelPath := s.managementPanelURL()
+		if path == panelPath && c.Query("safe-mode") == "configure" {
 			c.Next()
 			return
 		}
-		if (path == "/" || path == exampleAPIKeyManagementPath) && (c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead) {
+		if (path == "/" || path == panelPath) && (c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead) {
 			s.serveExampleAPIKeyWarningPage(c)
 			return
 		}
@@ -86,8 +93,9 @@ func (s *Server) exampleAPIKeySafeModeMiddleware() gin.HandlerFunc {
 
 		c.Header("X-CPA-SAFE-MODE", "example-api-key")
 		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-			"error":   "unsafe_example_api_key",
-			"message": "Proxy API endpoints are disabled because api-keys contains template values. Open /management.html?safe-mode=configure, update api-keys in Management, then retry.",
+			"error": "unsafe_example_api_key",
+			"message": fmt.Sprintf("Proxy API endpoints are disabled because api-keys contains template values. Open %s?safe-mode=configure, update api-keys in Management, then retry.",
+				s.managementPanelURL()),
 		})
 	}
 }
@@ -105,7 +113,7 @@ func (s *Server) serveExampleAPIKeyWarningPage(c *gin.Context) {
 		c.Abort()
 		return
 	}
-	c.String(http.StatusOK, safemode.ExampleAPIKeyWarningPageHTML(keys, exampleAPIKeyManagementURL))
+	c.String(http.StatusOK, safemode.ExampleAPIKeyWarningPageHTML(keys, s.managementPanelURL()+"?safe-mode=configure"))
 	c.Abort()
 }
 

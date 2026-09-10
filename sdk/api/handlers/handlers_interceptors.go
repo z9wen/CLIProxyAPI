@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	"golang.org/x/net/context"
@@ -286,7 +287,10 @@ func finalInterceptorHeaders(current, intercepted http.Header) http.Header {
 
 func downstreamHeadersFromExecutor(headers http.Header, passthrough bool) http.Header {
 	if !passthrough {
-		return nil
+		// passthrough-headers decides whether this proxy exposes the upstream
+		// verbatim. The Codex client headers are different in kind: losing them
+		// changes what the client does, so they are forwarded either way.
+		return helps.CodexResponseHeadersForClient(headers)
 	}
 	return FilterUpstreamHeaders(headers)
 }
@@ -295,7 +299,29 @@ func downstreamHeadersAfterInterceptors(baseRaw, finalRaw http.Header, passthrou
 	if passthrough {
 		return FilterUpstreamHeaders(finalRaw)
 	}
-	return FilterUpstreamHeaders(diffHeaders(baseRaw, finalRaw))
+	// The diff carries what an interceptor changed; the Codex client headers
+	// come from the upstream response and are forwarded regardless, for the
+	// reason given in downstreamHeadersFromExecutor.
+	return mergeHeaderMaps(
+		FilterUpstreamHeaders(diffHeaders(baseRaw, finalRaw)),
+		helps.CodexResponseHeadersForClient(finalRaw),
+	)
+}
+
+// mergeHeaderMaps returns a new map holding the union of both, preferring the
+// later map's values for keys present in both. Returns nil when both are empty.
+func mergeHeaderMaps(first, second http.Header) http.Header {
+	if len(first) == 0 && len(second) == 0 {
+		return nil
+	}
+	out := make(http.Header, len(first)+len(second))
+	for key, values := range first {
+		out[key] = values
+	}
+	for key, values := range second {
+		out[key] = values
+	}
+	return out
 }
 
 func diffHeaders(base, next http.Header) http.Header {

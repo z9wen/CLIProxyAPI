@@ -1526,8 +1526,12 @@ func TestManagementResponseExposesPluginSupportHeaderForCORS(t *testing.T) {
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusUnauthorized, rr.Body.String())
 	}
-	if got := rr.Header().Get("X-CPA-SUPPORT-PLUGIN"); got != pluginhost.SupportPluginHeaderValue() {
-		t.Fatalf("X-CPA-SUPPORT-PLUGIN = %q, want %q", got, pluginhost.SupportPluginHeaderValue())
+	// Build identifiers are only sent to authenticated callers. The control panel
+	// reads them from its own authenticated responses, so it does not need them on
+	// a 401 — and sending them there told anyone probing the path which version to
+	// attack.
+	if got := rr.Header().Get("X-CPA-SUPPORT-PLUGIN"); got != "" {
+		t.Fatalf("X-CPA-SUPPORT-PLUGIN = %q on an unauthenticated response, want it unset", got)
 	}
 
 	exposedHeaders := make(map[string]struct{})

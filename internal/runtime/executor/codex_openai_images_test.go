@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -93,11 +94,14 @@ func TestCodexExecutorDirectOpenAIImageGenerationUsesImagesEndpoint(t *testing.T
 	if gotAccept != "application/json" {
 		t.Fatalf("Accept = %q, want application/json", gotAccept)
 	}
-	if gotUA != codexUserAgent {
-		t.Fatalf("User-Agent = %q, want codex default %q", gotUA, codexUserAgent)
+	if gotUA != codexUserAgent() {
+		t.Fatalf("User-Agent = %q, want codex default %q", gotUA, codexUserAgent())
 	}
-	if gotVersion != "0.135.0" {
-		t.Fatalf("Version = %q, want %q", gotVersion, "0.135.0")
+	// The client sent 0.135.0, but cloaking forces the whole identity triple.
+	// Forwarding it would pair this version with a user-agent advertising
+	// registry.CodexClientVersion(), which is an identity no real client produces.
+	if gotVersion != registry.CodexClientVersion() {
+		t.Fatalf("Version = %q, want %q", gotVersion, registry.CodexClientVersion())
 	}
 	if gotTurnMetadata != `{"turn_id":"turn-1"}` {
 		t.Fatalf("X-Codex-Turn-Metadata = %q, want %q", gotTurnMetadata, `{"turn_id":"turn-1"}`)

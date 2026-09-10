@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -264,13 +265,8 @@ func (h *Handler) SetPostAuthPersistHook(hook coreauth.PostAuthHook) {
 // Additionally, remote access requires allow-remote-management=true.
 func (h *Handler) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		c.Header("X-CPA-VERSION", buildinfo.Version)
-		c.Header("X-CPA-COMMIT", buildinfo.Commit)
-		c.Header("X-CPA-BUILD-DATE", buildinfo.BuildDate)
-		c.Header("X-CPA-SUPPORT-PLUGIN", pluginhost.SupportPluginHeaderValue())
-
 		clientIP := c.ClientIP()
-		localClient := clientIP == "127.0.0.1" || clientIP == "::1"
+		localClient := IsLocalManagementClient(clientIP)
 
 		// Accept either Authorization: Bearer <key> or X-Management-Key
 		var provided string
@@ -291,8 +287,56 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 			c.AbortWithStatusJSON(statusCode, gin.H{"error": errMsg})
 			return
 		}
+
+		// Set only once the caller is authenticated. Sending the build identifiers
+		// with a rejection handed anyone who probed the path an exact version to
+		// match against known vulnerabilities, for no benefit: only the control
+		// panel reads these, and it never reads them from a failed request.
+		c.Header("X-CPA-VERSION", buildinfo.Version)
+		c.Header("X-CPA-COMMIT", buildinfo.Commit)
+		c.Header("X-CPA-BUILD-DATE", buildinfo.BuildDate)
+		c.Header("X-CPA-SUPPORT-PLUGIN", pluginhost.SupportPluginHeaderValue())
+
 		c.Next()
 	}
+}
+
+// IsLocalManagementClient reports whether clientIP is loopback. A client
+// connecting over IPv4-mapped IPv6 arrives as "::ffff:127.0.0.1", which the
+// string comparison this replaces would have classified as remote.
+func IsLocalManagementClient(clientIP string) bool {
+	parsed := net.ParseIP(strings.TrimSpace(clientIP))
+	return parsed != nil && parsed.IsLoopback()
+}
+
+// remoteManagementEnabled reports whether remote clients may reach the
+// management surface at all.
+func (h *Handler) remoteManagementEnabled() bool {
+	if h == nil {
+		return false
+	}
+	if h.allowRemoteOverride {
+		return true
+	}
+	if h.cfg == nil {
+		return false
+	}
+	return h.cfg.RemoteManagement.AllowRemote
+}
+
+// ManagementAccessAllowed reports whether a client at clientIP may reach the
+// management surface — the control panel as well as the API.
+//
+// The panel used to be served to anyone who could reach the port, regardless of
+// allow-remote-management, so a deployment that had explicitly disabled remote
+// management still handed its 2.8 MB admin UI to remote callers.
+func (h *Handler) ManagementAccessAllowed(clientIP string) bool {
+	// Checked before the short-circuit below: a nil handler must deny everything,
+	// and IsLocalManagementClient alone would have granted loopback callers.
+	if h == nil {
+		return false
+	}
+	return IsLocalManagementClient(clientIP) || h.remoteManagementEnabled()
 }
 
 // AuthenticateManagementKey verifies the provided management key for the given client.
@@ -306,16 +350,9 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 	}
 
 	cfg := h.cfg
-	var (
-		allowRemote bool
-		secretHash  string
-	)
+	var secretHash string
 	if cfg != nil {
-		allowRemote = cfg.RemoteManagement.AllowRemote
 		secretHash = cfg.RemoteManagement.SecretKey
-	}
-	if h.allowRemoteOverride {
-		allowRemote = true
 	}
 	envSecret := h.envSecret
 
@@ -334,7 +371,7 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 	}
 	h.attemptsMu.Unlock()
 
-	if !localClient && !allowRemote {
+	if !localClient && !h.remoteManagementEnabled() {
 		return false, http.StatusForbidden, "remote management disabled"
 	}
 

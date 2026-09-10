@@ -1083,17 +1083,19 @@ func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) 
 	if got := headers.Get("OpenAI-Beta"); got != codexResponsesWebsocketBetaHeaderValue {
 		t.Fatalf("OpenAI-Beta = %s, want %s", got, codexResponsesWebsocketBetaHeaderValue)
 	}
-	if got := headers.Get("User-Agent"); got != codexUserAgent {
-		t.Fatalf("User-Agent = %s, want %s", got, codexUserAgent)
+	if got := headers.Get("User-Agent"); got != codexUserAgent() {
+		t.Fatalf("User-Agent = %s, want %s", got, codexUserAgent())
 	}
-	if !strings.HasPrefix(codexUserAgent, codexOriginator+"/") {
-		t.Fatalf("default Codex User-Agent = %s, want prefix %s/", codexUserAgent, codexOriginator)
+	if !strings.HasPrefix(codexUserAgent(), codexOriginator+"/") {
+		t.Fatalf("default Codex User-Agent = %s, want prefix %s/", codexUserAgent(), codexOriginator)
 	}
-	if !strings.HasPrefix(codexUserAgent, "codex-tui/") {
-		t.Fatalf("default Codex User-Agent = %s, want codex-tui prefix", codexUserAgent)
+	// The prefix is the originator, and the TUI's originator is codex_cli_rs.
+	// Only the trailing USER_AGENT_SUFFIX names the codex-tui client.
+	if !strings.HasPrefix(codexUserAgent(), "codex_cli_rs/") {
+		t.Fatalf("default Codex User-Agent = %s, want codex_cli_rs prefix", codexUserAgent())
 	}
-	if !strings.Contains(codexUserAgent, "(codex-tui;") {
-		t.Fatalf("default Codex User-Agent = %s, want codex-tui suffix", codexUserAgent)
+	if !strings.Contains(codexUserAgent(), "(codex-tui;") {
+		t.Fatalf("default Codex User-Agent = %s, want codex-tui suffix", codexUserAgent())
 	}
 	if got := headers.Get("Originator"); got != codexOriginator {
 		t.Fatalf("Originator = %s, want %s", got, codexOriginator)
@@ -1157,8 +1159,8 @@ func TestApplyCodexWebsocketHeadersDefaultsToCodexCloaking(t *testing.T) {
 
 			headers = applyCodexWebsocketHeaders(ctx, headers, tt.auth, tt.token, cfg)
 
-			if got := headers.Get("User-Agent"); got != codexUserAgent {
-				t.Fatalf("User-Agent = %q, want %q", got, codexUserAgent)
+			if got := headers.Get("User-Agent"); got != codexUserAgent() {
+				t.Fatalf("User-Agent = %q, want %q", got, codexUserAgent())
 			}
 			if got := headers.Get("Originator"); got != codexOriginator {
 				t.Fatalf("Originator = %q, want %q", got, codexOriginator)
@@ -1199,11 +1201,11 @@ func TestApplyCodexWebsocketHeadersPassesThroughClientIdentityHeadersWhenCloakin
 	if got := headers.Get("X-Client-Request-Id"); got != "019d2233-e240-7162-992d-38df0a2a0e0d" {
 		t.Fatalf("X-Client-Request-Id = %s, want %s", got, "019d2233-e240-7162-992d-38df0a2a0e0d")
 	}
-	if got := headers["session_id"]; len(got) != 1 || got[0] != "legacy-session" {
+	if got := headers["session-id"]; len(got) != 1 || got[0] != "legacy-session" {
 		t.Fatalf("session_id = %#v, want [legacy-session]", got)
 	}
 	if got := headers.Get("Session-Id"); got != "" {
-		t.Fatalf("Session-Id = %s, want empty", got)
+		t.Fatalf("Session-Id = %s, want empty; the client sends session-id lowercase", got)
 	}
 }
 
@@ -1220,11 +1222,11 @@ func TestApplyCodexWebsocketHeadersCanonicalizesLegacyUnderscoreSessionHeader(t 
 
 	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", nil)
 
-	if got := headers["session_id"]; len(got) != 1 || got[0] != "legacy-underscore-session" {
+	if got := headers["session-id"]; len(got) != 1 || got[0] != "legacy-underscore-session" {
 		t.Fatalf("session_id = %#v, want [legacy-underscore-session]", got)
 	}
 	if got := headers.Get("Session-Id"); got != "" {
-		t.Fatalf("Session-Id = %s, want empty", got)
+		t.Fatalf("Session-Id = %s, want empty; the client sends session-id lowercase", got)
 	}
 }
 
@@ -1373,14 +1375,14 @@ func TestApplyCodexPromptCacheHeadersSetsSessionIDAndLegacyConversation(t *testi
 
 	_, headers := applyCodexPromptCacheHeaders("openai-response", req, []byte(`{"model":"gpt-5-codex"}`))
 
-	if got := headers["session_id"]; len(got) != 1 || got[0] != "cache-1" {
+	if got := headers["session-id"]; len(got) != 1 || got[0] != "cache-1" {
 		t.Fatalf("session_id = %#v, want [cache-1]", got)
 	}
 	if got := headers.Get("Session-Id"); got != "" {
-		t.Fatalf("Session-Id = %s, want empty", got)
+		t.Fatalf("Session-Id = %s, want empty; the client sends session-id lowercase", got)
 	}
-	if got := headers.Get("Conversation_id"); got != "cache-1" {
-		t.Fatalf("Conversation_id = %s, want cache-1", got)
+	if got := headers.Get("Conversation_id"); got != "" {
+		t.Fatalf("Conversation_id = %s, want absent: the real client sends no conversation_id header", got)
 	}
 }
 
@@ -1397,11 +1399,11 @@ func TestApplyCodexPromptCacheHeadersUsesDerivedSessionUUID(t *testing.T) {
 	if _, errParse := uuid.Parse(cacheKey); errParse != nil {
 		t.Fatalf("prompt_cache_key %q is not a UUID: %v", cacheKey, errParse)
 	}
-	if got := headers["session_id"]; len(got) != 1 || got[0] != cacheKey {
+	if got := headers["session-id"]; len(got) != 1 || got[0] != cacheKey {
 		t.Fatalf("session_id = %#v, want [%q]", got, cacheKey)
 	}
-	if got := headers.Get("Conversation_id"); got != cacheKey {
-		t.Fatalf("Conversation_id = %q, want %q", got, cacheKey)
+	if got := headers.Get("Conversation_id"); got != "" {
+		t.Fatalf("Conversation_id = %q, want absent: the real client sends no conversation_id header", got)
 	}
 }
 
@@ -1460,11 +1462,11 @@ func TestApplyCodexPromptCacheHeadersClaudeUsesClaudeCodeSessionID(t *testing.T)
 	if secondKey != firstKey {
 		t.Fatalf("same Claude Code session_id produced different websocket prompt_cache_key: first=%q second=%q", firstKey, secondKey)
 	}
-	if got := firstHeaders["session_id"]; len(got) != 1 || got[0] != firstKey {
-		t.Fatalf("first session_id = %#v, want [%q]", got, firstKey)
+	if got := firstHeaders["session-id"]; len(got) != 1 || got[0] != firstKey {
+		t.Fatalf("first session-id = %#v, want [%q]", got, firstKey)
 	}
-	if got := secondHeaders["session_id"]; len(got) != 1 || got[0] != firstKey {
-		t.Fatalf("second session_id = %#v, want [%q]", got, firstKey)
+	if got := secondHeaders["session-id"]; len(got) != 1 || got[0] != firstKey {
+		t.Fatalf("second session-id = %#v, want [%q]", got, firstKey)
 	}
 }
 
@@ -1479,7 +1481,7 @@ func TestApplyCodexPromptCacheHeadersClaudeRejectsBareUserID(t *testing.T) {
 	if got := gjson.GetBytes(body, "prompt_cache_key").String(); got != "" {
 		t.Fatalf("bare metadata.user_id must not create websocket prompt_cache_key, got %q; body=%s", got, string(body))
 	}
-	if got := headers["session_id"]; len(got) != 0 {
+	if got := headers["session-id"]; len(got) != 0 {
 		t.Fatalf("bare metadata.user_id must not create websocket session_id, got %#v", got)
 	}
 	if got := headers.Get("Session-Id"); got != "" {
@@ -1515,7 +1517,7 @@ func TestApplyCodexWebsocketHeadersIdentityConfuseRemapsPromptCacheKey(t *testin
 	if gotKey := gjson.GetBytes(body, "prompt_cache_key").String(); gotKey != expectedPromptCacheKey {
 		t.Fatalf("prompt_cache_key = %q, want %q", gotKey, expectedPromptCacheKey)
 	}
-	if gotSession := headers["session_id"]; len(gotSession) != 1 || gotSession[0] != expectedPromptCacheKey {
+	if gotSession := headers["session-id"]; len(gotSession) != 1 || gotSession[0] != expectedPromptCacheKey {
 		t.Fatalf("session_id = %#v, want [%q]", gotSession, expectedPromptCacheKey)
 	}
 	if gotCanonicalSession := headers.Get("Session-Id"); gotCanonicalSession != "" {
@@ -1527,8 +1529,8 @@ func TestApplyCodexWebsocketHeadersIdentityConfuseRemapsPromptCacheKey(t *testin
 	if gotThreadID := headers.Get("Thread-Id"); gotThreadID != expectedPromptCacheKey {
 		t.Fatalf("Thread-Id = %q, want %q", gotThreadID, expectedPromptCacheKey)
 	}
-	if gotConversation := headers.Get("Conversation_id"); gotConversation != expectedPromptCacheKey {
-		t.Fatalf("Conversation_id = %q, want %q", gotConversation, expectedPromptCacheKey)
+	if gotConversation := headers.Get("Conversation_id"); gotConversation != "" {
+		t.Fatalf("Conversation_id = %q, want absent", gotConversation)
 	}
 	if gotWindowID := headers.Get("X-Codex-Window-Id"); gotWindowID != expectedPromptCacheKey+":0" {
 		t.Fatalf("X-Codex-Window-Id = %q, want %q", gotWindowID, expectedPromptCacheKey+":0")
@@ -1736,8 +1738,8 @@ func TestApplyCodexHeadersDefaultsToCodexCloaking(t *testing.T) {
 
 	applyCodexHeadersFromSources(req, auth, "api-key", false, cfg, ginHeaders)
 
-	if got := req.Header.Get("User-Agent"); got != codexUserAgent {
-		t.Fatalf("User-Agent = %q, want %q", got, codexUserAgent)
+	if got := req.Header.Get("User-Agent"); got != codexUserAgent() {
+		t.Fatalf("User-Agent = %q, want %q", got, codexUserAgent())
 	}
 	if got := req.Header.Get("Originator"); got != codexOriginator {
 		t.Fatalf("Originator = %q, want %q", got, codexOriginator)
