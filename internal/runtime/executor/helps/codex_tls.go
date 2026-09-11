@@ -141,12 +141,10 @@ func builtinCodexOpenSSLClientHelloSpec() *tls.ClientHelloSpec {
 // CodexWebSocketClientHelloSpec returns the ClientHello for the WebSocket path: a
 // capture from disk when one exists, otherwise the built-in literal.
 //
-// With several captures it returns a different one on each call, drawn from the
-// set the real client produced. That client runs rustls, which reorders its
-// extensions on every connection, so replaying any one order would give every
-// handshake the same JA3 while a genuine client's changes each time. Every
-// capture is an ordering the client actually emitted, so rotating among them
-// removes the constant without inventing an order no client would send.
+// The captured record's extension order is regenerated for every handshake with
+// rustls's own ordering algorithm, because that client draws a fresh order per
+// connection and only ever sending a handful of the orderings it can produce is
+// a spread no real client has. See codex_hello_order.go.
 //
 // Callers must not cache the result: it is a per-handshake choice.
 func CodexWebSocketClientHelloSpec() *tls.ClientHelloSpec {

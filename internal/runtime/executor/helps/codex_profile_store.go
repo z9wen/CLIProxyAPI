@@ -38,8 +38,10 @@ const (
 	// One capture is one ordering, and the WebSocket transport needs several: the
 	// client it reproduces runs rustls, which reorders its extensions on every
 	// connection, so a replay that sends one fixed order gives every handshake the
-	// same JA3 while a real client's changes each time. Rotating among real
-	// captures keeps that spread without inventing an order no client would send.
+	// same JA3 while a real client's changes each time. The primary capture is the
+	// one whose extension order is regenerated per handshake; the samples beside
+	// it each record another order the client really emitted, and serve as the
+	// fallback when no order can be drawn.
 	CodexProfileWebSocketGlob = "codex-websocket-clienthello*.bin"
 	// CodexProfileWebSocketSampleFormat names the samples after the first, which
 	// is CodexProfileWebSocketFile.
@@ -77,6 +79,11 @@ var (
 	// codexProfileWebSockets is every captured WebSocket handshake, one ordering
 	// each. See CodexProfileWebSocketGlob.
 	codexProfileWebSockets []*tls.ClientHelloSpec
+	// codexProfileWebSocketRaw is the primary capture as the raw record. The
+	// WebSocket path re-derives its extension order from these bytes for every
+	// handshake, which needs the types still on the wire; a parsed spec has
+	// already turned them into typed extensions. See codex_hello_order.go.
+	codexProfileWebSocketRaw []byte
 )
 
 // CodexProfileDir returns the directory captured profiles are read from, or ""
@@ -142,9 +149,15 @@ func ReloadCodexProfiles() error {
 		firstErr = errWebSockets
 	}
 
+	var webSocketRaw []byte
+	if loaded, errRead := os.ReadFile(filepath.Join(dir, CodexProfileWebSocketFile)); errRead == nil {
+		webSocketRaw = loaded
+	}
+
 	codexProfileMu.Lock()
 	codexProfileHTTPSpec = httpSpec
 	codexProfileWebSockets = webSockets
+	codexProfileWebSocketRaw = webSocketRaw
 	codexProfileMu.Unlock()
 
 	if httpSpec != nil || len(webSockets) > 0 {
@@ -186,25 +199,59 @@ func loadCodexWebSocketProfiles(dir string) ([]*tls.ClientHelloSpec, error) {
 	return specs, firstErr
 }
 
-// capturedCodexWebSocketProfile returns one captured WebSocket profile, chosen
-// at random when several are present, or nil when the built-in should be used.
+// capturedCodexWebSocketProfile returns a WebSocket profile carrying an
+// extension order drawn for this handshake, or nil when the built-in should be
+// used. Callers must not cache the result: it is a per-handshake choice.
+//
+// The order is regenerated rather than replayed, because the client this
+// reproduces draws a fresh one per connection: rotating over a fixed set of
+// captures removed the constant but still only ever sent a handful of the
+// orderings a real client produces. See codex_hello_order.go.
 func capturedCodexWebSocketProfile() *tls.ClientHelloSpec {
 	codexProfileMu.RLock()
-	defer codexProfileMu.RUnlock()
-	if len(codexProfileWebSockets) == 0 {
+	raw := codexProfileWebSocketRaw
+	samples := codexProfileWebSockets
+	codexProfileMu.RUnlock()
+
+	if spec := codexWebSocketProfileWithDrawnOrder(raw); spec != nil {
+		return spec
+	}
+	// No usable raw capture: send one of the captured orderings verbatim, which
+	// is still the client's own, in preference to the built-in literal.
+	if len(samples) == 0 {
 		return nil
 	}
-	if len(codexProfileWebSockets) == 1 {
-		return cloneClientHelloSpec(codexProfileWebSockets[0])
-	}
-	index, errRand := rand.Int(rand.Reader, big.NewInt(int64(len(codexProfileWebSockets))))
+	index, errRand := rand.Int(rand.Reader, big.NewInt(int64(len(samples))))
 	if errRand != nil {
-		// Every sample is a valid handshake, so a failed draw is not a reason to
-		// fall back to the built-in one.
 		log.Debugf("codex tls: choose a WebSocket profile: %v", errRand)
-		return cloneClientHelloSpec(codexProfileWebSockets[0])
+		return cloneClientHelloSpec(samples[0])
 	}
-	return cloneClientHelloSpec(codexProfileWebSockets[index.Int64()])
+	return cloneClientHelloSpec(samples[index.Int64()])
+}
+
+// codexWebSocketProfileWithDrawnOrder rewrites the captured record's extension
+// order for one handshake. It returns nil when the record cannot be used, so the
+// caller can fall back instead of failing the connection.
+func codexWebSocketProfileWithDrawnOrder(raw []byte) *tls.ClientHelloSpec {
+	if len(raw) == 0 {
+		return nil
+	}
+	seed, errSeed := randomRustlsOrderSeed()
+	if errSeed != nil {
+		log.Debugf("codex tls: draw a WebSocket extension order: %v", errSeed)
+		return nil
+	}
+	reordered, errOrder := reorderClientHelloExtensions(raw, seed)
+	if errOrder != nil {
+		log.Debugf("codex tls: reorder WebSocket extensions: %v", errOrder)
+		return nil
+	}
+	spec, errFingerprint := (&tls.Fingerprinter{AllowBluntMimicry: true}).FingerprintClientHello(reordered)
+	if errFingerprint != nil {
+		log.Debugf("codex tls: reordered WebSocket profile is not a ClientHello: %v", errFingerprint)
+		return nil
+	}
+	return spec
 }
 
 // capturedCodexProfile returns the captured spec for a path, or nil when the

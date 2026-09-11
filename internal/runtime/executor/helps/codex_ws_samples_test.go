@@ -82,9 +82,11 @@ func TestCapturesAgreeOnExtensionSet(t *testing.T) {
 	}
 }
 
-// The rotation is the whole point: with several captures the accessor must not
-// keep handing back the same one, or the JA3 stays constant and the spread the
-// captures were collected for never reaches the wire.
+// The fallback path, taken when no raw record could be reordered: with several
+// captures the accessor must not keep handing back the same one, or the JA3
+// stays constant and the spread the captures were collected for never reaches
+// the wire. The primary path draws a fresh order instead; see
+// TestWebSocketProfileDrawsANewOrderPerHandshake.
 func TestWebSocketProfileRotatesAmongSamples(t *testing.T) {
 	restoreProfileState(t)
 
@@ -177,6 +179,7 @@ func restoreProfileState(t *testing.T) {
 	codexProfileMu.RLock()
 	previousHTTP := codexProfileHTTPSpec
 	previousWebSockets := append([]*tls.ClientHelloSpec(nil), codexProfileWebSockets...)
+	previousRaw := append([]byte(nil), codexProfileWebSocketRaw...)
 	codexProfileMu.RUnlock()
 
 	t.Cleanup(func() {
@@ -184,6 +187,7 @@ func restoreProfileState(t *testing.T) {
 		codexProfileDir = previousDir
 		codexProfileHTTPSpec = previousHTTP
 		codexProfileWebSockets = previousWebSockets
+		codexProfileWebSocketRaw = previousRaw
 		codexProfileMu.Unlock()
 	})
 	// Not parallel: the installed samples are package state.
@@ -191,6 +195,7 @@ func restoreProfileState(t *testing.T) {
 	codexProfileDir = ""
 	codexProfileHTTPSpec = nil
 	codexProfileWebSockets = nil
+	codexProfileWebSocketRaw = nil
 	codexProfileMu.Unlock()
 }
 
