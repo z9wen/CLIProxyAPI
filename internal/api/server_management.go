@@ -35,6 +35,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/config.yaml", s.mgmt.GetConfigYAML)
 		mgmt.PUT("/config.yaml", s.mgmt.PutConfigYAML)
 		mgmt.GET("/latest-version", s.mgmt.GetLatestVersion)
+		mgmt.GET("/codex-profile", s.mgmt.GetCodexProfile)
+		mgmt.POST("/codex-profile/refresh", s.mgmt.PostCodexProfileRefresh)
 		mgmt.GET("/plugins", s.mgmt.ListPlugins)
 		mgmt.GET("/plugin-store", s.mgmt.ListPluginStore)
 		mgmt.POST("/plugin-store/:id/install", s.mgmt.InstallPluginFromStore)
@@ -353,19 +355,166 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 }
 
 // codexProfileNoticeHTML renders the banner shown when the advertised Codex
-// version is held back. Returns "" when there is nothing to report.
+// version is held back, with the control that clears it. Returns "" when there
+// is nothing to report.
 func codexProfileNoticeHTML() string {
 	if registry.CodexProfileIsCurrent() {
 		return ""
 	}
 	advertised := template.HTMLEscapeString(registry.CodexClientVersion())
-	return fmt.Sprintf(`<div style="position:fixed;top:0;left:0;right:0;z-index:2147483647;`+
+	return fmt.Sprintf(`<div id="cpa-codex-notice" style="position:fixed;top:0;left:0;right:0;z-index:2147483647;`+
 		`padding:10px 14px;background:#7c2d12;color:#fff;`+
 		`font:13px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;text-align:center">`+
 		`Codex profile is behind upstream: this proxy advertises %s because a newer release changed its TLS `+
-		`stack and the handshake was not re-captured yet. Re-run tools/codexfp to update it.</div>`,
-		advertised)
+		`stack and the handshake was not re-captured yet.`+
+		`<button id="cpa-codex-refresh" style="margin-left:10px;padding:3px 12px;border:1px solid #fff;`+
+		`border-radius:4px;background:transparent;color:#fff;font:inherit;cursor:pointer">Re-capture now</button>`+
+		`<span id="cpa-codex-refresh-status" style="margin-left:10px"></span></div>`,
+		advertised) + codexProfileRefreshScript
 }
+
+// codexProfileRefreshScript drives the re-capture from the notice.
+//
+// The management key is needed to call the endpoint, and the panel already holds
+// it in localStorage. Reading it by storage key does not work: the panel is a
+// minified bundle whose storage keys are mangled, and they change with each panel
+// build. The property name the panel reads the key by survives minification, so
+// the key is found by scanning stored values for it instead.
+//
+// Three fallbacks, in order: our own remembered copy, that scan, and finally
+// asking. A failure at any of them leaves the panel untouched — the notice simply
+// reports it.
+const codexProfileRefreshScript = `<script>(function () {
+  var REMEMBERED = 'cpa-codex-management-key';
+  var button = document.getElementById('cpa-codex-refresh');
+  var status = document.getElementById('cpa-codex-refresh-status');
+  if (!button || !status) { return; }
+
+  function say(text, colour) { status.textContent = text; status.style.color = colour; }
+
+  function stored(name) {
+    try { return localStorage.getItem(name) || ''; } catch (e) { return ''; }
+  }
+
+  function remember(key) {
+    try { localStorage.setItem(REMEMBERED, key); } catch (e) { /* private mode */ }
+  }
+
+  function forget() {
+    try { localStorage.removeItem(REMEMBERED); } catch (e) { /* private mode */ }
+  }
+
+  // Depth-first over a parsed value, looking for the property the panel reads.
+  function hunt(value, depth) {
+    if (!value || depth > 5) { return ''; }
+    if (Array.isArray(value)) {
+      for (var i = 0; i < value.length; i++) {
+        var found = hunt(value[i], depth + 1);
+        if (found) { return found; }
+      }
+      return '';
+    }
+    if (typeof value !== 'object') { return ''; }
+    if (typeof value.managementKey === 'string' && value.managementKey.trim()) {
+      return value.managementKey.trim();
+    }
+    for (var k in value) {
+      if (!Object.prototype.hasOwnProperty.call(value, k)) { continue; }
+      var nested = hunt(value[k], depth + 1);
+      if (nested) { return nested; }
+    }
+    return '';
+  }
+
+  function discover() {
+    var kept = stored(REMEMBERED);
+    if (kept) { return kept; }
+    try {
+      for (var i = 0; i < localStorage.length; i++) {
+        var raw = localStorage.getItem(localStorage.key(i));
+        if (!raw) { continue; }
+        var parsed;
+        try { parsed = JSON.parse(raw); } catch (e) { continue; }
+        var found = hunt(parsed, 0);
+        if (found) { remember(found); return found; }
+      }
+    } catch (e) { /* storage unavailable */ }
+    return '';
+  }
+
+  function headers(key) { return { 'Authorization': 'Bearer ' + key }; }
+
+  function finish(state) {
+    button.disabled = false;
+    if (state.capture && state.capture.error) {
+      say('Failed: ' + state.capture.error, '#fecaca');
+      return;
+    }
+    if (state.current) {
+      var notice = document.getElementById('cpa-codex-notice');
+      if (notice && notice.parentNode) { notice.parentNode.removeChild(notice); }
+      return;
+    }
+    say('Finished, but the profile still reads as behind upstream.', '#fecaca');
+  }
+
+  function poll(key, startedAt) {
+    fetch('/v0/management/codex-profile', { headers: headers(key) })
+      .then(function (r) { return r.json(); })
+      .then(function (state) {
+        if (state.capture && state.capture.running) {
+          if (Date.now() - startedAt > 1800000) {
+            button.disabled = false;
+            say('Gave up waiting; check the proxy log.', '#fecaca');
+            return;
+          }
+          say('capturing, this takes a minute or two...', '#fde68a');
+          setTimeout(function () { poll(key, startedAt); }, 3000);
+          return;
+        }
+        finish(state);
+      })
+      .catch(function () {
+        // A dropped poll is not a failed capture; keep asking.
+        setTimeout(function () { poll(key, startedAt); }, 5000);
+      });
+  }
+
+  button.addEventListener('click', function () {
+    var key = discover();
+    if (!key) {
+      key = (window.prompt('Management key, to authorise the re-capture:') || '').trim();
+      if (!key) { say('No management key, so nothing was started.', '#fecaca'); return; }
+      remember(key);
+    }
+    button.disabled = true;
+    say('starting...', '#fde68a');
+    fetch('/v0/management/codex-profile/refresh', { method: 'POST', headers: headers(key) })
+      .then(function (r) {
+        if (r.status === 401 || r.status === 403) {
+          // A stale copy would otherwise be retried on every press.
+          forget();
+          throw new Error('the management key was rejected');
+        }
+        if (r.status === 409) {
+          // Someone else already started one; follow it rather than stacking.
+          poll(key, Date.now());
+          return null;
+        }
+        if (!r.ok) {
+          return r.json().then(function (body) {
+            throw new Error(body.message || ('HTTP ' + r.status));
+          }, function () { throw new Error('HTTP ' + r.status); });
+        }
+        poll(key, Date.now());
+        return null;
+      })
+      .catch(function (err) {
+        button.disabled = false;
+        say('Failed: ' + err.message, '#fecaca');
+      });
+  });
+})();</script>`
 
 // injectBeforeBodyClose appends fragment just before </body>. Falling back to a
 // plain append keeps the panel working if the document has no closing body tag.
