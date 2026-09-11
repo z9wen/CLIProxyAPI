@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"testing"
 	"time"
@@ -334,4 +335,61 @@ func TestWebSocketHandshakeUsesTheRotatedCapture(t *testing.T) {
 		t.Fatalf("%d handshakes all sent one extension order (%v); the rotation is not reaching the wire", handshakes, seen)
 	}
 	t.Logf("%d handshakes produced %d distinct extension orders", handshakes, len(seen))
+}
+
+// uTLS does not treat the spec it is given as read-only: ApplyPreset generates a
+// key share and writes it back, and skips any share that already has data. A
+// captured profile is cached and shared by every connection, so without a copy
+// the first handshake primes it and every later one replays that first
+// connection's keys — with no post-quantum private key at all, which aborts the
+// handshake the moment the server selects that group.
+func TestHandshakeDoesNotMutateTheCachedProfile(t *testing.T) {
+	restoreProfileState(t)
+
+	record, errRead := os.ReadFile(filepath.Join("testdata", CodexProfileWebSocketFile))
+	if errRead != nil {
+		t.Fatalf("read the reference capture: %v", errRead)
+	}
+	spec, errFingerprint := (&tls.Fingerprinter{AllowBluntMimicry: true}).FingerprintClientHello(record)
+	if errFingerprint != nil {
+		t.Fatalf("fingerprint: %v", errFingerprint)
+	}
+	installWebSocketSamples(t, []*tls.ClientHelloSpec{spec})
+
+	before := keyShareDataLengths(spec)
+	// Two handshakes: the first is what would prime a shared spec.
+	for i := 0; i < 2; i++ {
+		captureClientHelloFromDial(t, func(addr string) {
+			conn, errDial := net.DialTimeout("tcp", addr, 5*time.Second)
+			if errDial != nil {
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, errApply := ApplyCodexWebSocketClientHello(ctx, conn, "chatgpt.com"); errApply != nil && !errors.Is(errApply, context.DeadlineExceeded) {
+				t.Logf("websocket handshake: %v", errApply)
+			}
+		})
+	}
+
+	if after := keyShareDataLengths(spec); !reflect.DeepEqual(before, after) {
+		t.Fatalf("the handshake changed the cached profile: key share data lengths %v -> %v;"+
+			" every later handshake would replay the first connection's keys", before, after)
+	}
+}
+
+// keyShareDataLengths reports what each key share carries, which is what uTLS
+// fills in and what a reused spec would carry over from an earlier connection.
+func keyShareDataLengths(spec *tls.ClientHelloSpec) []int {
+	var lengths []int
+	for _, ext := range spec.Extensions {
+		shares, ok := ext.(*tls.KeyShareExtension)
+		if !ok {
+			continue
+		}
+		for _, share := range shares.KeyShares {
+			lengths = append(lengths, len(share.Data))
+		}
+	}
+	return lengths
 }

@@ -195,16 +195,16 @@ func capturedCodexWebSocketProfile() *tls.ClientHelloSpec {
 		return nil
 	}
 	if len(codexProfileWebSockets) == 1 {
-		return codexProfileWebSockets[0]
+		return cloneClientHelloSpec(codexProfileWebSockets[0])
 	}
 	index, errRand := rand.Int(rand.Reader, big.NewInt(int64(len(codexProfileWebSockets))))
 	if errRand != nil {
 		// Every sample is a valid handshake, so a failed draw is not a reason to
 		// fall back to the built-in one.
 		log.Debugf("codex tls: choose a WebSocket profile: %v", errRand)
-		return codexProfileWebSockets[0]
+		return cloneClientHelloSpec(codexProfileWebSockets[0])
 	}
-	return codexProfileWebSockets[index.Int64()]
+	return cloneClientHelloSpec(codexProfileWebSockets[index.Int64()])
 }
 
 // capturedCodexProfile returns the captured spec for a path, or nil when the
@@ -215,7 +215,10 @@ func capturedCodexProfile(kind codexProfileKind) *tls.ClientHelloSpec {
 	}
 	codexProfileMu.RLock()
 	defer codexProfileMu.RUnlock()
-	return codexProfileHTTPSpec
+	// Copied on the way out: see cloneClientHelloSpec. Handing the cached one to
+	// uTLS would let the first handshake fill in its key shares, and every later
+	// one would then replay that first connection's keys.
+	return cloneClientHelloSpec(codexProfileHTTPSpec)
 }
 
 func loadCodexProfileFile(path string) (*tls.ClientHelloSpec, error) {
