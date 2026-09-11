@@ -535,12 +535,18 @@ const codexProfileControlScript = `<script>(function () {
       control.id = ID;
       control.type = 'button';
       control.textContent = ours;
-      // Copy the sibling's computed styling rather than guessing at the panel's
-      // theme, so the control matches whichever panel revision is on disk.
-      var cs = window.getComputedStyle(buttons[i]);
-      ['font', 'padding', 'border', 'borderRadius', 'background', 'color', 'cursor'].forEach(function (prop) {
-        control.style[prop] = cs[prop];
-      });
+      // Take the sibling's own classes. They are CSS-module hashes, but they are
+      // the panel's real rules, so the control inherits its hover and focus
+      // states too — which copying resolved styles cannot reproduce, and which is
+      // what makes a borrowed copy look subtly wrong next to the original.
+      if (buttons[i].className) {
+        control.className = buttons[i].className;
+      } else {
+        var cs = window.getComputedStyle(buttons[i]);
+        ['font', 'padding', 'border', 'borderRadius', 'background', 'color', 'cursor'].forEach(function (prop) {
+          control.style[prop] = cs[prop];
+        });
+      }
       control.style.marginLeft = '6px';
 
       var status = document.createElement('span');
