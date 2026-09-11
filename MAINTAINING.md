@@ -267,6 +267,11 @@ The changes are confined to:
   and the stale-profile notice plus its re-capture button
 - `cmd/server/main.go` — points the loader at the profile directory at startup
 - `tools/codexfp/` (new, its own Go module) — capture and verification tooling
+- `.github/workflows/release.yaml` — bounds the changelog when a tag has no
+  predecessor, without which a fork's first release cannot publish (GitHub caps a
+  release body at 125000 characters, and the whole upstream history overruns it)
+- `.github/workflows/docker-image.yml` — publishes to GHCR with the workflow token,
+  rather than to DockerHub with secrets a fork does not have
 
 Nothing under `internal/translator/`. When rebasing, the two files most likely to
 conflict are `codex_executor_request.go` (upstream edits the same header code) and
