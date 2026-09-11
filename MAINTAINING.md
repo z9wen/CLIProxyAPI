@@ -109,8 +109,8 @@ running and why the last one failed.
 
 Two details worth keeping: the archive lands **beside the profile directory, not in
 `/tmp`** — on the routers this runs on `/tmp` is tmpfs, so 112 MB there is 112 MB of
-resident memory — and the run is repeated so that one refresh yields several WebSocket
-orderings (see below).
+resident memory — and the run is repeated, because one refresh should also leave behind
+several WebSocket orderings to fall back on (see below).
 
 **By hand, with `tools/codexfp`.** Still the path when there is no Linux host to hand,
 and still what produces the reference captures under `helps/testdata/`:
@@ -139,14 +139,24 @@ so the JA3/JA4 a server computes differs each time. Replaying a single fixed ord
 therefore gives every handshake the same JA3 while a genuine client's changes — a
 constant where the real article has a spread, which is its own signal.
 
-This tree keeps **several** real captures (`codex-websocket-clienthello*.bin`) and picks
-one at random per handshake, so every order sent is one the client actually emitted and
-nothing is synthesised. A single capture is still honoured as the old behaviour.
+This tree **draws a fresh order per handshake with rustls's own algorithm**, ported from
+0.23's `order_insensitive_extensions_in_random_order` and `low_quality_integer_hash`:
+a stable sort by that hash of `(seed<<16)|extension_type`, with the extensions the
+standard pins to the end left in place, and a u16 seed from `crypto/rand` per connection.
+It runs over the captured record's **raw bytes** rather than the parsed spec, because
+that is where the extension types are still on the wire; a spec has already turned them
+into typed extensions, and the type is what the hash keys on.
 
-Reproducing rustls's ordering algorithm instead was tried and abandoned: it means
-carrying a copy of rustls's hash into this tree, it only pays off if the server goes as
-far as checking that a permutation is one rustls could emit, and uTLS applies extension
-side effects in list order — so arbitrary permutations are not free to apply.
+This is checked against the client rather than only against itself: every captured
+ordering is reproducible from the reference record by exactly one seed, so an error in
+the hash or the sort would leave them unreachable. Live handshakes against `chatgpt.com`
+were accepted while carrying distinct orders.
+
+Rotating among the captures was the first implementation and was replaced. It removed the
+constant but still only ever sent a handful of the orderings a real client produces —
+a spread no genuine client has, which is a signal in its own right. The extra captures
+(`codex-websocket-clienthello*.bin`) are kept as the fallback: when the raw record cannot
+be used, one is sent verbatim, which is still an order the client really emitted.
 
 ### Deliberately not done
 
@@ -167,6 +177,21 @@ side effects in list order — so arbitrary permutations are not free to apply.
 - `x-codex-turn-metadata`, `x-codex-window-id`, `x-client-request-id` and friends are
   passed through from the downstream client, not synthesised. A real Codex CLI sends
   them; a plain `curl` does not. Fabricating them would be more suspicious, not less.
+- **The TCP/IP layer differs and cannot be made to match.** The real client is a macOS
+  process; this proxy runs on the router. TTL, window scaling, TCP options and the
+  initial congestion window come from the host stack, and NAT does not rewrite them, so
+  from one public address the handshake reads as macOS while the packets read as Linux.
+  Nothing above the socket can change that.
+- **Behaviour and timing are untouched**: connection reuse patterns, request pacing and
+  concurrency shape are whatever this proxy already did.
+
+Two things were checked and turned out **not** to be gaps, which is worth knowing before
+re-investigating them. Extension bodies are compared byte for byte against the captures
+on both transports and agree, leaving only the key share, which is drawn per connection
+on both sides. And neither implementation resumes TLS sessions: rustls is configured to
+cache them by default, but the client builds a fresh `ClientConfig` per WebSocket
+connection, so the cache is never reused — confirmed by completing 21 real handshakes
+against `chatgpt.com` and seeing no `pre_shared_key` on any of them.
 
 ---
 
@@ -265,8 +290,12 @@ The changes are confined to:
 - `internal/runtime/executor/helps/codex_tls.go` (new) — TLS profiles, transports
 - `internal/runtime/executor/helps/codex_tls_test.go` (new) — the byte-level tests
 - `internal/runtime/executor/helps/codex_profile_store.go` (new) — loads captures from
-  disk, and picks one WebSocket ordering per handshake
-- `internal/runtime/executor/helps/codex_ws_samples_test.go` (new) — the ordering tests
+  disk, and hands the WebSocket path a record whose order it redraws per handshake
+- `internal/runtime/executor/helps/codex_hello_order.go` (new) — rustls's extension
+  ordering, ported
+- `internal/runtime/executor/helps/codex_hello_order_test.go` (new) — the ordering tests
+- `internal/runtime/executor/helps/codex_ws_samples_test.go` (new) — the fallback and
+  rotation tests
 - `internal/runtime/executor/helps/testdata/` (new) — the captures they compare against
 - `internal/registry/codex_version.go` (new) — version tracking, TLS-stack drift check
 - `internal/registry/codex_profile.go` (new) — the profile baseline and its persistence
