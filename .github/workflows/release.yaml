@@ -56,12 +56,23 @@ jobs:
             changelog_range="$GITHUB_REF_NAME"
           fi
 
-          git log --reverse --pretty=format:'- %s (%h)' "$changelog_range" |
+          # A tag with no predecessor has no range to describe, so changelog_range
+          # collapses to the tag itself — the whole history. On a fork that is every
+          # upstream commit, which overruns the release body limit. Bound the list
+          # and let the compare link below carry the rest.
+          git log --reverse -n 100 --pretty=format:'- %s (%h)' "$changelog_range" |
             grep -Ev '^- (docs:|test:)' > "$changelog_entries_file" || true
 
-          gh api "repos/${GH_REPO}/releases/generate-notes" \
-            -f tag_name="$GITHUB_REF_NAME" \
-            --jq .body > "$generated_notes_file"
+          # Same reason: with no previous tag to compare against, GitHub generates
+          # notes for the entire history. Fall through to the compare link instead.
+          if [[ -n "$previous_tag" ]]; then
+            gh api "repos/${GH_REPO}/releases/generate-notes" \
+              -f tag_name="$GITHUB_REF_NAME" \
+              -f previous_tag_name="$previous_tag" \
+              --jq .body > "$generated_notes_file"
+          else
+            : > "$generated_notes_file"
+          fi
           if [[ ! -s "$generated_notes_file" ]]; then
             if [[ -n "$previous_tag" ]]; then
               printf '**Full Changelog**: https://github.com/%s/compare/%s...%s\n' "$GH_REPO" "$previous_tag" "$GITHUB_REF_NAME" > "$generated_notes_file"
