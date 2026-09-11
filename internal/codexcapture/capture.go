@@ -83,6 +83,9 @@ const (
 	// extensions per connection, so every run adds one; a handful is enough to
 	// stop the order being a constant, and each extra run costs a client start-up.
 	webSocketSamples = 6
+	// workDirPrefix names the scratch directory a capture runs in. It is swept by
+	// prefix, so creation and the sweep cannot disagree.
+	workDirPrefix = ".codexcapture-"
 	// Caps the extracted binary. The real one is ~90 MB; the bound exists so a
 	// malformed archive cannot fill the disk.
 	maxCodexBinarySize = 512 << 20
@@ -256,11 +259,32 @@ func createWorkDir(profileDir string) (string, error) {
 	if errMkdir := os.MkdirAll(parent, 0o700); errMkdir != nil {
 		return "", fmt.Errorf("codexcapture: create %s: %w", parent, errMkdir)
 	}
-	workDir, errWork := os.MkdirTemp(parent, ".codexcapture-")
+	sweepStaleWorkDirs(parent)
+	workDir, errWork := os.MkdirTemp(parent, workDirPrefix)
 	if errWork != nil {
 		return "", fmt.Errorf("codexcapture: create a work directory in %s: %w", parent, errWork)
 	}
 	return workDir, nil
+}
+
+// sweepStaleWorkDirs removes scratch directories an earlier capture left behind.
+//
+// A capture that returns removes its own directory, so anything found here is
+// from one that did not finish — the process was killed, or the host lost power.
+// Each holds a 112 MB archive's worth of extraction, and on the routers this runs
+// on that is worth reclaiming rather than leaving to accumulate.
+func sweepStaleWorkDirs(parent string) {
+	stale, errGlob := filepath.Glob(filepath.Join(parent, workDirPrefix+"*"))
+	if errGlob != nil {
+		return
+	}
+	for _, path := range stale {
+		if errRemove := os.RemoveAll(path); errRemove != nil {
+			log.Warnf("codexcapture: remove the work directory %s left by an earlier capture: %v", path, errRemove)
+			continue
+		}
+		log.Infof("codexcapture: removed the work directory %s left by an earlier capture", path)
+	}
 }
 
 // linuxArch maps the host architecture onto the name Codex publishes builds for.
