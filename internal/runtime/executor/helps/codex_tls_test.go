@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -105,15 +106,114 @@ func TestCodexWebSocketClientHelloMatchesCapture(t *testing.T) {
 	if !reflect.DeepEqual(got.CipherSuites, reference.CipherSuites) {
 		t.Fatalf("cipher suites = %v, want %v", got.CipherSuites, reference.CipherSuites)
 	}
-	if !reflect.DeepEqual(got.ExtensionTypes, reference.ExtensionTypes) {
-		t.Fatalf("extension types = %v, want %v", got.ExtensionTypes, reference.ExtensionTypes)
-	}
-	if !reflect.DeepEqual(got.ExtensionLengths, reference.ExtensionLengths) {
-		t.Fatalf("extension lengths = %v, want %v", got.ExtensionLengths, reference.ExtensionLengths)
+	// Which capture is drawn decides the order, so what has to match the reference
+	// is which extensions were sent and how long each was, not the sequence.
+	if !sameExtensionMultiset(got.ExtensionTypes, got.ExtensionLengths, reference.ExtensionTypes, reference.ExtensionLengths) {
+		t.Fatalf("extension set = %v, want the capture's %v",
+			pairExtensions(got.ExtensionTypes, got.ExtensionLengths),
+			pairExtensions(reference.ExtensionTypes, reference.ExtensionLengths))
 	}
 	if !reflect.DeepEqual(got.KeyShareGroups, reference.KeyShareGroups) {
 		t.Fatalf("key share groups = %v, want %v", got.KeyShareGroups, reference.KeyShareGroups)
 	}
+}
+
+// teeConn passes everything through to a real connection while keeping a copy of
+// what the client wrote, so a live handshake can also report which extension
+// order it sent. Distinct from recordingConn above, which stands in for a
+// connection rather than wrapping one.
+type teeConn struct {
+	net.Conn
+	sent bytes.Buffer
+}
+
+func (c *teeConn) Write(p []byte) (int, error) {
+	c.sent.Write(p)
+	return c.Conn.Write(p)
+}
+
+// The ordering moves extensions within the set rustls itself moves, so the
+// standard permits it — but "permitted" is not "accepted". The claim that matters
+// is that the real server still completes the handshake, and only a real server
+// can settle that: the capture tests above read a ClientHello off a local
+// listener and never finish a TLS exchange.
+//
+// Gated on an environment variable because it reaches the network:
+//
+//	CODEX_TLS_LIVE_HOST=chatgpt.com go test ./internal/runtime/executor/helps \
+//	    -run TestLiveCodexWebsocketHandshakeIsAccepted -v
+func TestLiveCodexWebsocketHandshakeIsAccepted(t *testing.T) {
+	host := strings.TrimSpace(os.Getenv("CODEX_TLS_LIVE_HOST"))
+	if host == "" {
+		t.Skip("set CODEX_TLS_LIVE_HOST to exercise the handshake against the real server")
+	}
+
+	const attempts = 5
+	orders := make(map[string]int, attempts)
+	rejected := make([]string, 0, attempts)
+	for i := 0; i < attempts; i++ {
+		record, errHandshake := liveCodexWebsocketHandshake(t, host)
+		order := liveExtensionOrder(t, record)
+		if errHandshake != nil {
+			// The ClientHello was still sent — the server answered it with a close —
+			// so its order is the one that was refused.
+			rejected = append(rejected, order)
+			t.Logf("attempt %d: REJECTED (%v), extensions %s", i+1, errHandshake, order)
+			continue
+		}
+		orders[order]++
+		t.Logf("attempt %d: accepted, extensions %s", i+1, order)
+	}
+	if len(rejected) > 0 {
+		t.Errorf("the server refused %d of %d handshakes; orders: %v", len(rejected), attempts, rejected)
+	}
+	if len(orders) < 2 {
+		t.Fatalf("%d live handshakes all sent the same extension order; the ordering is not being applied", attempts)
+	}
+	t.Logf("%d live handshakes produced %d distinct extension orders", attempts, len(orders))
+}
+
+// liveCodexWebsocketHandshake completes a real TLS handshake at host:443 with the
+// profile the WebSocket transport sends, and returns the ClientHello it sent.
+func liveCodexWebsocketHandshake(t *testing.T, host string) ([]byte, error) {
+	t.Helper()
+
+	conn, errDial := net.DialTimeout("tcp", net.JoinHostPort(host, "443"), 10*time.Second)
+	if errDial != nil {
+		return nil, fmt.Errorf("dial %s: %w", host, errDial)
+	}
+	recorder := &teeConn{Conn: conn}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	tlsConn, errApply := ApplyCodexWebSocketClientHello(ctx, recorder, host)
+	if errApply != nil {
+		if errClose := conn.Close(); errClose != nil {
+			t.Logf("close conn: %v", errClose)
+		}
+		// Returned anyway: a refused handshake still sent a ClientHello, and which
+		// order it carried is the whole point of the failure.
+		record, _ := extractClientHelloRecord(recorder.sent.Bytes())
+		return record, errApply
+	}
+	if errClose := tlsConn.Close(); errClose != nil {
+		t.Logf("close tls conn: %v", errClose)
+	}
+
+	record, ok := extractClientHelloRecord(recorder.sent.Bytes())
+	if !ok {
+		return nil, errors.New("the ClientHello is not in what the transport wrote")
+	}
+	return record, nil
+}
+
+func liveExtensionOrder(t *testing.T, record []byte) string {
+	t.Helper()
+	shape, errShape := shapeOfClientHello(record)
+	if errShape != nil {
+		t.Fatalf("parse the ClientHello that was sent: %v", errShape)
+	}
+	return fmt.Sprint(shape.ExtensionTypes)
 }
 
 // TestCodexWebsocketHeaderOrderRewritesGorillaHandshake pins the upgrade

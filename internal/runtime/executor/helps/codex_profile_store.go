@@ -1,10 +1,13 @@
 package helps
 
 import (
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
@@ -27,8 +30,20 @@ import (
 const (
 	// CodexProfileHTTPFile is the HTTP/SSE path's captured ClientHello.
 	CodexProfileHTTPFile = "codex-http-clienthello.bin"
-	// CodexProfileWebSocketFile is the WebSocket path's captured ClientHello.
+	// CodexProfileWebSocketFile is the primary WebSocket capture. Additional
+	// samples sit beside it; see CodexProfileWebSocketGlob.
 	CodexProfileWebSocketFile = "codex-websocket-clienthello.bin"
+	// CodexProfileWebSocketGlob matches every captured WebSocket handshake.
+	//
+	// One capture is one ordering, and the WebSocket transport needs several: the
+	// client it reproduces runs rustls, which reorders its extensions on every
+	// connection, so a replay that sends one fixed order gives every handshake the
+	// same JA3 while a real client's changes each time. Rotating among real
+	// captures keeps that spread without inventing an order no client would send.
+	CodexProfileWebSocketGlob = "codex-websocket-clienthello*.bin"
+	// CodexProfileWebSocketSampleFormat names the samples after the first, which
+	// is CodexProfileWebSocketFile.
+	CodexProfileWebSocketSampleFormat = "codex-websocket-clienthello.%d.bin"
 )
 
 type codexProfileKind int
@@ -53,9 +68,15 @@ func (k codexProfileKind) label() string {
 }
 
 var (
-	codexProfileMu       sync.RWMutex
-	codexProfileDir      string
-	codexProfileCaptured map[codexProfileKind]*tls.ClientHelloSpec
+	codexProfileMu  sync.RWMutex
+	codexProfileDir string
+	// codexProfileHTTPSpec is the HTTP/SSE path's profile. That path runs OpenSSL,
+	// which orders its extensions deterministically — three captures of the real
+	// client agreed byte for byte — so one capture describes it completely.
+	codexProfileHTTPSpec *tls.ClientHelloSpec
+	// codexProfileWebSockets is every captured WebSocket handshake, one ordering
+	// each. See CodexProfileWebSocketGlob.
+	codexProfileWebSockets []*tls.ClientHelloSpec
 )
 
 // CodexProfileDir returns the directory captured profiles are read from, or ""
@@ -107,39 +128,94 @@ func ReloadCodexProfiles() error {
 		return nil
 	}
 
-	loaded := make(map[codexProfileKind]*tls.ClientHelloSpec)
 	var firstErr error
-	for _, kind := range []codexProfileKind{codexProfileHTTP, codexProfileWebSocket} {
-		spec, err := loadCodexProfileFile(filepath.Join(dir, kind.fileName()))
-		if err != nil {
-			if !errors.Is(err, os.ErrNotExist) && firstErr == nil {
-				firstErr = err
-			}
-			continue
+	httpSpec, errHTTP := loadCodexProfileFile(filepath.Join(dir, codexProfileHTTP.fileName()))
+	if errHTTP != nil {
+		if !errors.Is(errHTTP, os.ErrNotExist) {
+			firstErr = errHTTP
 		}
-		loaded[kind] = spec
+		httpSpec = nil
+	}
+
+	webSockets, errWebSockets := loadCodexWebSocketProfiles(dir)
+	if errWebSockets != nil && firstErr == nil {
+		firstErr = errWebSockets
 	}
 
 	codexProfileMu.Lock()
-	codexProfileCaptured = loaded
+	codexProfileHTTPSpec = httpSpec
+	codexProfileWebSockets = webSockets
 	codexProfileMu.Unlock()
 
-	if len(loaded) > 0 {
-		kinds := make([]string, 0, len(loaded))
-		for kind := range loaded {
-			kinds = append(kinds, kind.label())
+	if httpSpec != nil || len(webSockets) > 0 {
+		kinds := make([]string, 0, 2)
+		if httpSpec != nil {
+			kinds = append(kinds, codexProfileHTTP.label())
 		}
-		log.Infof("codex tls: using captured ClientHello profiles from %s (%v)", dir, kinds)
+		if len(webSockets) > 0 {
+			kinds = append(kinds, fmt.Sprintf("%s x%d", codexProfileWebSocket.label(), len(webSockets)))
+		}
+		log.Infof("codex tls: using captured ClientHello profiles from %s (%s)", dir, strings.Join(kinds, ", "))
 	}
 	return firstErr
+}
+
+// loadCodexWebSocketProfiles reads every captured WebSocket handshake, in a
+// stable order so a given deployment rotates through the same set.
+func loadCodexWebSocketProfiles(dir string) ([]*tls.ClientHelloSpec, error) {
+	matches, errGlob := filepath.Glob(filepath.Join(dir, CodexProfileWebSocketGlob))
+	if errGlob != nil {
+		return nil, fmt.Errorf("codex tls: scan %s: %w", dir, errGlob)
+	}
+	sort.Strings(matches)
+
+	specs := make([]*tls.ClientHelloSpec, 0, len(matches))
+	var firstErr error
+	for _, path := range matches {
+		spec, errLoad := loadCodexProfileFile(path)
+		if errLoad != nil {
+			// One unreadable sample must not cost the others: they are independent
+			// orderings of the same handshake.
+			if firstErr == nil {
+				firstErr = errLoad
+			}
+			continue
+		}
+		specs = append(specs, spec)
+	}
+	return specs, firstErr
+}
+
+// capturedCodexWebSocketProfile returns one captured WebSocket profile, chosen
+// at random when several are present, or nil when the built-in should be used.
+func capturedCodexWebSocketProfile() *tls.ClientHelloSpec {
+	codexProfileMu.RLock()
+	defer codexProfileMu.RUnlock()
+	if len(codexProfileWebSockets) == 0 {
+		return nil
+	}
+	if len(codexProfileWebSockets) == 1 {
+		return codexProfileWebSockets[0]
+	}
+	index, errRand := rand.Int(rand.Reader, big.NewInt(int64(len(codexProfileWebSockets))))
+	if errRand != nil {
+		// Every sample is a valid handshake, so a failed draw is not a reason to
+		// fall back to the built-in one.
+		log.Debugf("codex tls: choose a WebSocket profile: %v", errRand)
+		return codexProfileWebSockets[0]
+	}
+	return codexProfileWebSockets[index.Int64()]
 }
 
 // capturedCodexProfile returns the captured spec for a path, or nil when the
 // built-in one should be used.
 func capturedCodexProfile(kind codexProfileKind) *tls.ClientHelloSpec {
+	if kind == codexProfileWebSocket {
+		return capturedCodexWebSocketProfile()
+	}
 	codexProfileMu.RLock()
 	defer codexProfileMu.RUnlock()
-	return codexProfileCaptured[kind]
+	return codexProfileHTTPSpec
 }
 
 func loadCodexProfileFile(path string) (*tls.ClientHelloSpec, error) {
