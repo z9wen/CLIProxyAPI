@@ -348,9 +348,14 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		c.AbortWithStatus(http.StatusInternalServerError)
 		return
 	}
+	// The control is on every panel load, so a re-capture is reachable without
+	// waiting for the profile to fall behind; the banner only when there is
+	// something to say. Injected in this order so the script runs after the
+	// banner markup it wires up.
 	if notice := codexProfileNoticeHTML(); notice != "" {
 		panel = injectBeforeBodyClose(panel, notice)
 	}
+	panel = injectBeforeBodyClose(panel, codexProfileControlScript)
 	c.Data(http.StatusOK, "text/html; charset=utf-8", panel)
 }
 
@@ -370,7 +375,7 @@ func codexProfileNoticeHTML() string {
 		`<button id="cpa-codex-refresh" style="margin-left:10px;padding:3px 12px;border:1px solid #fff;`+
 		`border-radius:4px;background:transparent;color:#fff;font:inherit;cursor:pointer">Re-capture now</button>`+
 		`<span id="cpa-codex-refresh-status" style="margin-left:10px"></span></div>`,
-		advertised) + codexProfileRefreshScript
+		advertised)
 }
 
 // codexProfileRefreshScript drives the re-capture from the notice.
@@ -384,34 +389,31 @@ func codexProfileNoticeHTML() string {
 // Three fallbacks, in order: our own remembered copy, that scan, and finally
 // asking. A failure at any of them leaves the panel untouched — the notice simply
 // reports it.
-const codexProfileRefreshScript = `<script>(function () {
+const codexProfileControlScript = `<script>(function () {
   var REMEMBERED = 'cpa-codex-management-key';
-  var button = document.getElementById('cpa-codex-refresh');
-  var status = document.getElementById('cpa-codex-refresh-status');
-  if (!button || !status) { return; }
+  // The panel labels its own "check for updates" button in each locale it ships.
+  // Matching those labels is how the permanent control finds the management
+  // centre page: the panel exposes no id or test hook, and its CSS-module class
+  // names are per-build hashes. A panel that renames them gets no control rather
+  // than a broken one.
+  var ANCHORS = [
+    { label: '检查更新', ours: '更新 Codex 指纹' },
+    { label: '檢查更新', ours: '更新 Codex 指紋' },
+    { label: 'Check for updates', ours: 'Update Codex profile' },
+    { label: 'Проверить обновления', ours: 'Обновить профиль Codex' }
+  ];
+  var ID = 'cpa-codex-recapture';
 
-  function say(text, colour) { status.textContent = text; status.style.color = colour; }
+  function stored(name) { try { return localStorage.getItem(name) || ''; } catch (e) { return ''; } }
+  function remember(key) { try { localStorage.setItem(REMEMBERED, key); } catch (e) { /* private mode */ } }
+  function forget() { try { localStorage.removeItem(REMEMBERED); } catch (e) { /* private mode */ } }
 
-  function stored(name) {
-    try { return localStorage.getItem(name) || ''; } catch (e) { return ''; }
-  }
-
-  function remember(key) {
-    try { localStorage.setItem(REMEMBERED, key); } catch (e) { /* private mode */ }
-  }
-
-  function forget() {
-    try { localStorage.removeItem(REMEMBERED); } catch (e) { /* private mode */ }
-  }
-
-  // Depth-first over a parsed value, looking for the property the panel reads.
+  // Depth-first over a parsed value, looking for the property the panel reads
+  // the management key by. Its storage key is mangled and changes per build.
   function hunt(value, depth) {
     if (!value || depth > 5) { return ''; }
     if (Array.isArray(value)) {
-      for (var i = 0; i < value.length; i++) {
-        var found = hunt(value[i], depth + 1);
-        if (found) { return found; }
-      }
+      for (var i = 0; i < value.length; i++) { var a = hunt(value[i], depth + 1); if (a) { return a; } }
       return '';
     }
     if (typeof value !== 'object') { return ''; }
@@ -420,8 +422,7 @@ const codexProfileRefreshScript = `<script>(function () {
     }
     for (var k in value) {
       if (!Object.prototype.hasOwnProperty.call(value, k)) { continue; }
-      var nested = hunt(value[k], depth + 1);
-      if (nested) { return nested; }
+      var b = hunt(value[k], depth + 1); if (b) { return b; }
     }
     return '';
   }
@@ -442,53 +443,51 @@ const codexProfileRefreshScript = `<script>(function () {
     return '';
   }
 
-  function headers(key) { return { 'Authorization': 'Bearer ' + key }; }
-
-  function finish(state) {
-    button.disabled = false;
-    if (state.capture && state.capture.error) {
-      say('Failed: ' + state.capture.error, '#fecaca');
-      return;
-    }
-    if (state.current) {
-      var notice = document.getElementById('cpa-codex-notice');
-      if (notice && notice.parentNode) { notice.parentNode.removeChild(notice); }
-      return;
-    }
-    say('Finished, but the profile still reads as behind upstream.', '#fecaca');
+  function keyFor() {
+    var key = discover();
+    if (key) { return key; }
+    key = (window.prompt('Management key, to authorise the re-capture:') || '').trim();
+    if (key) { remember(key); }
+    return key;
   }
 
-  function poll(key, startedAt) {
+  function headers(key) { return { 'Authorization': 'Bearer ' + key }; }
+
+  function poll(key, startedAt, say, button) {
     fetch('/v0/management/codex-profile', { headers: headers(key) })
       .then(function (r) { return r.json(); })
       .then(function (state) {
         if (state.capture && state.capture.running) {
           if (Date.now() - startedAt > 1800000) {
-            button.disabled = false;
-            say('Gave up waiting; check the proxy log.', '#fecaca');
+            if (button) { button.disabled = false; }
+            say('Gave up waiting; check the proxy log.', '#b91c1c');
             return;
           }
-          say('capturing, this takes a minute or two...', '#fde68a');
-          setTimeout(function () { poll(key, startedAt); }, 3000);
+          say('capturing, this takes a minute or two...', '#b45309');
+          setTimeout(function () { poll(key, startedAt, say, button); }, 3000);
           return;
         }
-        finish(state);
+        if (button) { button.disabled = false; }
+        if (state.capture && state.capture.error) {
+          say('Failed: ' + state.capture.error, '#b91c1c');
+          return;
+        }
+        say(state.current ? 'Done; the profile matches upstream again'
+                          : 'Finished, but the profile still reads as behind upstream.',
+            state.current ? '#15803d' : '#b91c1c');
       })
       .catch(function () {
         // A dropped poll is not a failed capture; keep asking.
-        setTimeout(function () { poll(key, startedAt); }, 5000);
+        setTimeout(function () { poll(key, startedAt, say, button); }, 5000);
       });
   }
 
-  button.addEventListener('click', function () {
-    var key = discover();
-    if (!key) {
-      key = (window.prompt('Management key, to authorise the re-capture:') || '').trim();
-      if (!key) { say('No management key, so nothing was started.', '#fecaca'); return; }
-      remember(key);
-    }
-    button.disabled = true;
-    say('starting...', '#fde68a');
+  // Both controls run the same capture, so they cannot drift apart in behaviour.
+  function run(say, button) {
+    var key = keyFor();
+    if (!key) { say('No management key, so nothing was started.', '#b91c1c'); return; }
+    if (button) { button.disabled = true; }
+    say('starting...', '#b45309');
     fetch('/v0/management/codex-profile/refresh', { method: 'POST', headers: headers(key) })
       .then(function (r) {
         if (r.status === 401 || r.status === 403) {
@@ -496,24 +495,78 @@ const codexProfileRefreshScript = `<script>(function () {
           forget();
           throw new Error('the management key was rejected');
         }
-        if (r.status === 409) {
-          // Someone else already started one; follow it rather than stacking.
-          poll(key, Date.now());
-          return null;
-        }
+        if (r.status === 409) { poll(key, Date.now(), say, button); return null; }
         if (!r.ok) {
-          return r.json().then(function (body) {
-            throw new Error(body.message || ('HTTP ' + r.status));
-          }, function () { throw new Error('HTTP ' + r.status); });
+          return r.json().then(function (body) { throw new Error(body.message || ('HTTP ' + r.status)); },
+                               function () { throw new Error('HTTP ' + r.status); });
         }
-        poll(key, Date.now());
+        poll(key, Date.now(), say, button);
         return null;
       })
       .catch(function (err) {
-        button.disabled = false;
-        say('Failed: ' + err.message, '#fecaca');
+        if (button) { button.disabled = false; }
+        say('Failed: ' + err.message, '#b91c1c');
       });
-  });
+  }
+
+  // 1. The banner, present only while the profile is behind upstream.
+  var banner = document.getElementById('cpa-codex-refresh');
+  var bannerStatus = document.getElementById('cpa-codex-refresh-status');
+  if (banner && bannerStatus) {
+    var sayBanner = function (text, colour) { bannerStatus.textContent = text; bannerStatus.style.color = colour; };
+    banner.addEventListener('click', function () { run(sayBanner, banner); });
+  }
+
+  // 2. The permanent control, beside the panel's own update button.
+  function place() {
+    if (document.getElementById(ID)) { return true; }
+    var buttons = document.querySelectorAll('button');
+    for (var i = 0; i < buttons.length; i++) {
+      var label = (buttons[i].getAttribute('aria-label') || buttons[i].getAttribute('title') || '').trim();
+      var ours = '';
+      for (var j = 0; j < ANCHORS.length; j++) {
+        if (ANCHORS[j].label === label) { ours = ANCHORS[j].ours; break; }
+      }
+      if (!ours) { continue; }
+      var row = buttons[i].parentNode;
+      if (!row) { continue; }
+
+      var control = document.createElement('button');
+      control.id = ID;
+      control.type = 'button';
+      control.textContent = ours;
+      // Copy the sibling's computed styling rather than guessing at the panel's
+      // theme, so the control matches whichever panel revision is on disk.
+      var cs = window.getComputedStyle(buttons[i]);
+      ['font', 'padding', 'border', 'borderRadius', 'background', 'color', 'cursor'].forEach(function (prop) {
+        control.style[prop] = cs[prop];
+      });
+      control.style.marginLeft = '6px';
+
+      var status = document.createElement('span');
+      status.style.cssText = 'margin-left:8px;font-size:12px';
+      var say = function (text, colour) { status.textContent = text; status.style.color = colour; };
+
+      control.addEventListener('click', function () { run(say, control); });
+      row.appendChild(control);
+      row.appendChild(status);
+      return true;
+    }
+    return false;
+  }
+
+  if (!place()) {
+    // The panel renders that page through its own router, so it may not be on
+    // screen yet. Watch for it, but throttle: this observes the whole document.
+    var last = 0;
+    var observer = new MutationObserver(function () {
+      var now = Date.now();
+      if (now - last < 500) { return; }
+      last = now;
+      if (place()) { observer.disconnect(); }
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+  }
 })();</script>`
 
 // injectBeforeBodyClose appends fragment just before </body>. Falling back to a

@@ -79,7 +79,18 @@ profiles, which is what clears the freeze.
 
 ### Re-capturing
 
-**From the panel.** The stale-profile notice carries a *Re-capture now* button. It calls
+**From the panel.** A control sits beside the panel's own *Check for updates* button
+on the management-centre page, and the stale-profile banner carries its own while the
+profile is behind. The permanent one is the point: without it a re-capture is only
+reachable while the profile happens to be stale.
+
+It is placed by matching the panel's localised label for its update button — the panel
+exposes no id or test hook, and its CSS-module class names are per-build hashes. A
+panel that renames those labels gets no control rather than a broken one. The button's
+styling is copied from its sibling at runtime so it matches whichever panel revision is
+on disk.
+
+The control calls
 `POST /v0/management/codex-profile/refresh` (management key, like the rest of that
 group), which runs `internal/codexcapture` in the background:
 
