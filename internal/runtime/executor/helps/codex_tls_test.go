@@ -3,6 +3,7 @@ package helps
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -38,9 +39,85 @@ type clientHelloShape struct {
 	CipherSuites     []uint16
 	ExtensionTypes   []uint16
 	ExtensionLengths []int
-	Groups           []tls.CurveID
-	KeyShareGroups   []tls.CurveID
-	ALPN             []string
+	// ExtensionBodies is each extension's payload, in wire order. Types and
+	// lengths agreeing is not the same as agreeing on content: an extension can
+	// carry the right number of bytes and still say something else.
+	ExtensionBodies [][]byte
+	Groups          []tls.CurveID
+	KeyShareGroups  []tls.CurveID
+	ALPN            []string
+}
+
+// bodyFor returns the payload of the first extension of the given type.
+func (s clientHelloShape) bodyFor(extType uint16) ([]byte, bool) {
+	for i, got := range s.ExtensionTypes {
+		if got == extType && i < len(s.ExtensionBodies) {
+			return s.ExtensionBodies[i], true
+		}
+	}
+	return nil, false
+}
+
+// differingExtensionBodies reports every extension whose payload differs from
+// the reference's, skipping the ones that are per-connection by design: a key
+// share carries freshly generated keys, and nothing else here does.
+func differingExtensionBodies(got, reference clientHelloShape) []string {
+	var problems []string
+	for i, extType := range reference.ExtensionTypes {
+		if extType == extensionTypeKeyShare || i >= len(reference.ExtensionBodies) {
+			continue
+		}
+		body, ok := got.bodyFor(extType)
+		if !ok {
+			problems = append(problems, fmt.Sprintf("extension %d is missing", extType))
+			continue
+		}
+		if !bytes.Equal(body, reference.ExtensionBodies[i]) {
+			problems = append(problems, fmt.Sprintf("extension %d carries %x, the capture carries %x",
+				extType, body, reference.ExtensionBodies[i]))
+		}
+	}
+	return problems
+}
+
+// extensionTypeKeyShare is the one extension whose bytes are drawn per
+// connection, so only its structure can be compared.
+const extensionTypeKeyShare = 51
+
+// The body comparison has to be able to fail, or it would pass on any
+// ClientHello at all.
+func TestDifferingExtensionBodiesDetectsChange(t *testing.T) {
+	t.Parallel()
+
+	reference := clientHelloShape{
+		ExtensionTypes:  []uint16{0x0000, 0x000d, extensionTypeKeyShare},
+		ExtensionBodies: [][]byte{{0x00, 0x0b}, {0x04, 0x03}, {0xde, 0xad}},
+	}
+	// Same bodies in a different order, with a key share drawn for this
+	// connection: this is what a WebSocket handshake actually looks like.
+	same := clientHelloShape{
+		ExtensionTypes:  []uint16{extensionTypeKeyShare, 0x000d, 0x0000},
+		ExtensionBodies: [][]byte{{0xbe, 0xef}, {0x04, 0x03}, {0x00, 0x0b}},
+	}
+	if problems := differingExtensionBodies(same, reference); len(problems) != 0 {
+		t.Fatalf("a reordered ClientHello carrying the same bodies was reported as different: %v", problems)
+	}
+
+	changed := clientHelloShape{
+		ExtensionTypes:  []uint16{0x0000, 0x000d, extensionTypeKeyShare},
+		ExtensionBodies: [][]byte{{0x00, 0x0b}, {0x04, 0x04}, {0xbe, 0xef}},
+	}
+	if problems := differingExtensionBodies(changed, reference); len(problems) == 0 {
+		t.Fatal("a ClientHello carrying a different signature_algorithms was reported as matching")
+	}
+
+	absent := clientHelloShape{
+		ExtensionTypes:  []uint16{0x0000, extensionTypeKeyShare},
+		ExtensionBodies: [][]byte{{0x00, 0x0b}, {0xbe, 0xef}},
+	}
+	if problems := differingExtensionBodies(absent, reference); len(problems) == 0 {
+		t.Fatal("a ClientHello missing an extension the capture carries was reported as matching")
+	}
 }
 
 func TestCodexHTTPClientHelloMatchesCapture(t *testing.T) {
@@ -69,6 +146,9 @@ func TestCodexHTTPClientHelloMatchesCapture(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.KeyShareGroups, reference.KeyShareGroups) {
 		t.Fatalf("key share groups = %v, want %v", got.KeyShareGroups, reference.KeyShareGroups)
+	}
+	if problems := differingExtensionBodies(got, reference); len(problems) > 0 {
+		t.Fatalf("the ClientHello does not carry the capture's extensions: %v", problems)
 	}
 }
 
@@ -116,6 +196,10 @@ func TestCodexWebSocketClientHelloMatchesCapture(t *testing.T) {
 	if !reflect.DeepEqual(got.KeyShareGroups, reference.KeyShareGroups) {
 		t.Fatalf("key share groups = %v, want %v", got.KeyShareGroups, reference.KeyShareGroups)
 	}
+	// The order is drawn per handshake, so the bodies are compared by type.
+	if problems := differingExtensionBodies(got, reference); len(problems) > 0 {
+		t.Fatalf("the ClientHello does not carry the capture's extensions: %v", problems)
+	}
 }
 
 // teeConn passes everything through to a real connection while keeping a copy of
@@ -146,6 +230,14 @@ func TestLiveCodexWebsocketHandshakeIsAccepted(t *testing.T) {
 	host := strings.TrimSpace(os.Getenv("CODEX_TLS_LIVE_HOST"))
 	if host == "" {
 		t.Skip("set CODEX_TLS_LIVE_HOST to exercise the handshake against the real server")
+	}
+
+	// Load the captures first: without them the built-in literal is a single
+	// fixed order, and the run would only be re-checking that constant rather
+	// than the record whose order is redrawn per handshake.
+	restoreProfileState(t)
+	if errProfiles := SetCodexProfileDir("testdata"); errProfiles != nil {
+		t.Fatalf("load the captured profiles: %v", errProfiles)
 	}
 
 	const attempts = 5
@@ -526,6 +618,7 @@ func shapeOfClientHello(record []byte) (clientHelloShape, error) {
 		CipherSuites:     suites,
 		ExtensionTypes:   extTypes,
 		ExtensionLengths: extLengths,
+		ExtensionBodies:  extensionBodies(record),
 	}
 
 	// Groups, key shares and ALPN are value-level details; uTLS parses those
@@ -547,6 +640,48 @@ func shapeOfClientHello(record []byte) (clientHelloShape, error) {
 		}
 	}
 	return shape, nil
+}
+
+// extensionBodies walks the record and returns each extension's payload, in wire
+// order. Nil when the record cannot be walked, which the callers treat as a
+// mismatch rather than a pass.
+func extensionBodies(record []byte) [][]byte {
+	pos := 9 + 2 + 32
+	if pos+1 > len(record) {
+		return nil
+	}
+	sessionIDLen := int(record[pos])
+	pos += 1 + sessionIDLen
+	if pos+2 > len(record) {
+		return nil
+	}
+	pos += 2 + int(binary.BigEndian.Uint16(record[pos:pos+2]))
+	if pos+1 > len(record) {
+		return nil
+	}
+	pos += 1 + int(record[pos])
+	if pos+2 > len(record) {
+		return nil
+	}
+	end := pos + 2 + int(binary.BigEndian.Uint16(record[pos:pos+2]))
+	pos += 2
+	if end > len(record) {
+		return nil
+	}
+
+	var bodies [][]byte
+	for pos < end {
+		if pos+4 > end {
+			return nil
+		}
+		length := int(binary.BigEndian.Uint16(record[pos+2 : pos+4]))
+		if pos+4+length > end {
+			return nil
+		}
+		bodies = append(bodies, record[pos+4:pos+4+length])
+		pos += 4 + length
+	}
+	return bodies
 }
 
 // parseClientHelloLayout walks the record far enough to report the cipher suite
