@@ -27,8 +27,8 @@ import (
 // the mismatch this machinery exists to remove.
 const CodexProfileVersion = "0.154.0"
 
-// codexProfileOpenSSLSys and codexProfileRustls pin the TLS dependencies the
-// captured ClientHello profiles came from.
+// codexProfileBuiltinOpenSSLSys and codexProfileBuiltinRustls pin the TLS
+// dependencies the ClientHello profiles compiled into this binary came from.
 //
 // These, not the release version, decide when a re-capture is due. The Codex
 // client iterates quickly — releases land constantly — but its TLS stack does
@@ -36,10 +36,11 @@ const CodexProfileVersion = "0.154.0"
 // across at least rust-v0.150.0 through rust-v0.154.0. Warning on every release
 // would be noise, and noise gets ignored.
 //
-// Update both alongside a fresh capture. See tools/codexfp/README.md.
+// They seed the baseline a never-captured install starts on. A capture
+// supersedes them at runtime; see CodexProfileBaseline.
 const (
-	codexProfileOpenSSLSys = "0.9.111"
-	codexProfileRustls     = "0.23.36"
+	codexProfileBuiltinOpenSSLSys = "0.9.111"
+	codexProfileBuiltinRustls     = "0.23.36"
 )
 
 // codexLockURLTemplate fetches a release's Cargo.lock. That file is a few
@@ -59,13 +60,6 @@ var codexLockPackagePattern = regexp.MustCompile(`(?m)^name = "([^"]+)"\nversion
 type codexTLSStack struct {
 	OpenSSLSys []string
 	Rustls     []string
-}
-
-// matchesProfile reports whether the captured profiles still describe this
-// release's TLS stack.
-func (s codexTLSStack) matchesProfile() bool {
-	return singleVersionEquals(s.OpenSSLSys, codexProfileOpenSSLSys) &&
-		singleVersionEquals(s.Rustls, codexProfileRustls)
 }
 
 // singleVersionEquals reports whether a crate resolved to exactly the pinned
@@ -176,6 +170,7 @@ var codexClientVersion atomic.Value
 var codexProfileCurrent atomic.Bool
 
 func init() {
+	codexProfileBaseline.Store(BuiltinCodexProfileBaseline())
 	codexClientVersion.Store(CodexProfileVersion)
 	// True by construction: the pinned version is the one that was captured.
 	codexProfileCurrent.Store(true)
@@ -183,13 +178,14 @@ func init() {
 
 // CodexClientVersion returns the Codex release the wire identity advertises.
 func CodexClientVersion() string {
+	baseline := CurrentCodexProfileBaseline()
 	if !codexProfileCurrent.Load() {
-		return CodexProfileVersion
+		return baseline.Version
 	}
 	if version, ok := codexClientVersion.Load().(string); ok && version != "" {
 		return version
 	}
-	return CodexProfileVersion
+	return baseline.Version
 }
 
 // CodexProfileIsCurrent reports whether the advertised identity still describes
@@ -212,20 +208,21 @@ func SetCodexClientVersion(version string) {
 	if CodexClientVersion() == version {
 		return
 	}
+	baseline := CurrentCodexProfileBaseline()
 	if !codexProfileCurrent.Load() {
 		log.Debugf("codex: ignoring version %s; the advertised version is held at %s until the profile is re-captured",
-			version, CodexProfileVersion)
+			version, baseline.Version)
 		return
 	}
 	codexClientVersion.Store(version)
 
-	if version != CodexProfileVersion {
+	if version != baseline.Version {
 		// No warning here. A new release does not mean the profile is stale: the
 		// TLS stack moves far more slowly than the release cadence, and warning on
 		// every release produces noise that gets ignored. refreshCodexVersion
 		// reads the stack itself and warns only when the profiles really are out
 		// of date.
-		log.Infof("codex: advertising %s, profile captured from %s", version, CodexProfileVersion)
+		log.Infof("codex: advertising %s, profile captured from %s", version, baseline.Version)
 	}
 }
 
@@ -293,7 +290,8 @@ func warnIfCodexTLSStackDrifted(ctx context.Context, version string) {
 		log.Debugf("codex: could not read the TLS stack for %s: %v", version, errStack)
 		return
 	}
-	if stack.matchesProfile() {
+	baseline := CurrentCodexProfileBaseline()
+	if baseline.matches(stack) {
 		return
 	}
 	// Freeze before warning so the identity is coherent even if the log is missed.
@@ -302,9 +300,23 @@ func warnIfCodexTLSStackDrifted(ctx context.Context, version string) {
 		return
 	}
 	log.Warnf("codex: holding the advertised version at %s; %s ships %s, but the profiles were captured from "+
-		"openssl-sys %s / rustls %s. Re-capture with tools/codexfp (see tools/codexfp/README.md); until then this "+
-		"proxy keeps claiming %s, which is coherent but older than upstream.",
-		CodexProfileVersion, version, stack, codexProfileOpenSSLSys, codexProfileRustls, CodexProfileVersion)
+		"openssl-sys %s / rustls %s. Re-capture from the management panel's Codex profile notice, or with "+
+		"tools/codexfp (see tools/codexfp/README.md); until then this proxy keeps claiming %s, which is coherent "+
+		"but older than upstream.",
+		baseline.Version, version, stack, baseline.OpenSSLSys, baseline.Rustls, baseline.Version)
+}
+
+// LatestCodexRelease returns the newest published Codex release version.
+//
+// A capture targets this rather than the advertised version. The advertised one
+// is held back exactly when the profiles are behind, so capturing it again would
+// reproduce the handshake already in place and leave the drift in force.
+func LatestCodexRelease(ctx context.Context) (string, error) {
+	version, _, errVersion := fetchLatestCodexVersion(ctx)
+	if errVersion != nil {
+		return "", fmt.Errorf("codex: look up the latest release: %w", errVersion)
+	}
+	return version, nil
 }
 
 func fetchLatestCodexVersion(ctx context.Context) (string, string, error) {

@@ -782,6 +782,12 @@ func setupCodexTLSProfile(configFilePath string) {
 	if err := helps.SetCodexProfileDir(dir); err != nil {
 		log.Warnf("codex tls: captured profile unusable, keeping the built-in one: %v", err)
 	}
+	// The baseline a capture records beside its profiles is what stops a
+	// re-captured install from coming back up on the compiled-in pins, deciding
+	// the release it just captured from has drifted, and freezing itself again.
+	if err := registry.SetCodexProfileBaselineDir(dir); err != nil {
+		log.Warnf("codex: recorded profile baseline unusable, keeping the built-in one: %v", err)
+	}
 }
 
 func startModelCatalogUpdaters(localModel, homeEnabled bool) {
