@@ -41,6 +41,17 @@ const (
 	codexReleaseChecksumsTemplate = "https://github.com/openai/codex/releases/download/rust-v%s/codex-package_SHA256SUMS"
 )
 
+// captureTarget is the host the captured client must be talking to for its
+// handshake to describe the Codex API.
+//
+// The client opens connections of its own besides the API call — its update
+// check reaches api.github.com — and those handshakes are indistinguishable from
+// the API's by shape: same process, same TLS stack, so the same classifier files
+// them both as the HTTP profile. Only the target tells them apart, and a profile
+// taken from the wrong one would be a github.com handshake the proxy then sends
+// to chatgpt.com.
+const captureTarget = "chatgpt.com:443"
+
 // codexPackageBinaryEntry is where the package variant keeps the client.
 //
 // The package variant is used rather than the bare binary because it is the one
@@ -344,6 +355,10 @@ func captureRun(ctx context.Context, listener *clientHelloListener, binaryPath, 
 		hello, errNext := listener.Next(collectCtx)
 		if errNext != nil {
 			break
+		}
+		if hello.target != captureTarget {
+			log.Debugf("codexcapture: ignoring a handshake for %s; the profile describes %s", hello.target, captureTarget)
+			continue
 		}
 		kind, errClassify := classify(hello.record)
 		if errClassify != nil {
