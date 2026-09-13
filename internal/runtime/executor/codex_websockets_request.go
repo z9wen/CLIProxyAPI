@@ -65,7 +65,7 @@ func applyCodexPromptCacheHeadersWithContext(ctx context.Context, from sdktransl
 	return rawJSON, headers, nil
 }
 
-func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *cliproxyauth.Auth, token string, cfg *config.Config, clientHeaders ...http.Header) http.Header {
+func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *cliproxyauth.Auth, token string, cfg *config.Config, nativeRequest bool, clientHeaders ...http.Header) http.Header {
 	if headers == nil {
 		headers = http.Header{}
 	}
@@ -90,6 +90,9 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	misc.EnsureHeader(headers, ginHeaders, "x-client-request-id", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-responsesapi-include-timing-metrics", "")
 	misc.EnsureHeader(headers, ginHeaders, "Version", "")
+	if nativeRequest {
+		misc.EnsureHeader(headers, ginHeaders, codexResponsesLiteHeader, "")
+	}
 	if isAPIKey {
 		ensureHeaderWithPriority(headers, ginHeaders, "User-Agent", "", "")
 	} else {
@@ -107,6 +110,21 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	sessionFallback := ""
 	if strings.Contains(headers.Get("User-Agent"), "Mac OS") {
 		sessionFallback = uuid.NewString()
+	}
+	if nativeRequest && cfg != nil && cfg.Codex.DisableCodexCloaking {
+		deleteHeaderCaseInsensitive(headers, "session_id")
+		deleteHeaderCaseInsensitive(headers, "conversation_id")
+		// session-id is deliberately absent from the list below: the session
+		// header is written just after this, under the client's own spelling, and
+		// a gin header map is canonicalised on the way in — echoing the key here
+		// would land it back as Session-Id and undo that.
+		for key, values := range ginHeaders {
+			switch strings.ToLower(key) {
+			case "session_id", "conversation_id", "thread-id", "x-codex-routing-hint", "x-codex-window-id":
+				deleteHeaderCaseInsensitive(headers, key)
+				headers[key] = append([]string(nil), values...)
+			}
+		}
 	}
 	ensureCodexWebsocketSessionHeader(headers, ginHeaders, sessionFallback)
 	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
