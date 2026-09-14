@@ -699,6 +699,10 @@ jobs:
     runs-on: ubuntu-latest
     if: always()
     needs:
+      # Listed even though every other need already depends on it: the needs
+      # context only exposes jobs named here, so without it the upload below
+      # addresses an empty tag.
+      - prepare-release
       - build-hosted
       - build-linux-glibc
       - build-linux-no-plugin
