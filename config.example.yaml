@@ -44,11 +44,16 @@ remote-management:
   # GitHub repository for the management control panel. Accepts a repository URL or releases API URL.
   panel-github-repository: "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
 
-  # Path the control panel is served at. Defaults to "management.html".
-  # Renaming it keeps the panel off the fixed-path wordlists bulk scanners use.
-  # That is friction, not an access control boundary: reachability still follows
-  # allow-remote, and disable-control-panel remains the way to turn the panel off.
-  # panel-path: "console.html"
+  # Path the control panel is served at. Empty means "management.html"; set it to
+  # something else, e.g. "console.html", to keep the panel off the fixed-path
+  # wordlists bulk scanners use. That is friction, not an access control boundary:
+  # reachability still follows allow-remote, and disable-control-panel remains the
+  # way to turn the panel off.
+  # This renames the route only; the asset on disk stays management.html.
+  # One path segment ending in ".html", letters, digits, "-", "_" and "." only.
+  # Anything else is logged and ignored, and the panel stays at the default, so
+  # check the startup log rather than assuming a value took effect.
+  panel-path: ""
 
 # Authentication directory (supports ~ for home directory)
 auth-dir: "~/.cli-proxy-api"
