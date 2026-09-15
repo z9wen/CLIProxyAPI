@@ -112,6 +112,32 @@ Two details worth keeping: the archive lands **beside the profile directory, not
 resident memory — and the run is repeated, because one refresh should also leave behind
 several WebSocket orderings to fall back on (see below).
 
+**From a Mac, with `tools/capture-codex-profile.sh`.** The panel's button cannot work on
+a host that is not Linux: the capture runs the Linux build, so `codexcapture` refuses
+before it starts. The script does the same capture in a throwaway Linux container.
+
+```bash
+tools/capture-codex-profile.sh --profile-dir /path/to/codex-profile
+```
+
+It cross-compiles the server for `linux/<host arch>`, runs it against the mounted
+profile directory on a loopback port (18318 by default — 18317 is often taken by a CPA
+manager), drives `POST /v0/management/codex-profile/refresh`, and removes the container
+afterwards. The captures land in the mounted directory, so the server picks them up on
+its next start; restarting it is left to the operator, because how the server is
+launched is the deployment's business. `--profile-dir` must already hold captures — the
+script will not create one, so a typo cannot quietly write profiles somewhere the server
+never reads.
+
+It retries a failed capture twice more before giving up. The release assets come from a
+CDN that drops the connection often enough to be worth it — two runs in a row failed at
+the checksums fetch this way — and a failure lands within seconds of the start, so the
+retry is cheap.
+
+One thing it has to do that a plain `docker run` would not: the base image carries no CA
+bundle, and installing one means a distribution mirror as a network dependency on every
+run. The host's own bundle is mounted instead, with `SSL_CERT_FILE` pointing Go at it.
+
 **By hand, with `tools/codexfp`.** Still the path when there is no Linux host to hand,
 and still what produces the reference captures under `helps/testdata/`:
 
